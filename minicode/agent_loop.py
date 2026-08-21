@@ -762,19 +762,22 @@ def run_agent_turn(
     enable_work_chain: bool = True,
     callbacks: AgentTurnCallbacks | AgentTurnEventSink | None = None,
 ) -> list[ChatMessage]:
-    # Slice-4 shim: LangGraph delegate is opt-in (MINICODE_USE_GRAPH=1 or runtime={"useGraph": True})
-    # to keep legacy tests green while exposing the new path for migration callers.
+    # Slice-5 shim: LangGraph is now the default (flip from opt-in).
+    # Rollback via MINICODE_USE_GRAPH=0 or runtime={"useGraph": False}.
     import warnings as _warnings
     _warnings.warn(
         "minicode.agent_loop.run_agent_turn is deprecated; use minicode.graph.run_graph_turn",
         DeprecationWarning,
         stacklevel=2,
     )
-    want_graph = False
-    if os.environ.get("MINICODE_USE_GRAPH", "").strip().lower() in {"1", "true", "yes"}:
+    want_graph = True
+    _env_val = os.environ.get("MINICODE_USE_GRAPH", "").strip().lower()
+    if _env_val in {"0", "false", "no", "off"}:
+        want_graph = False
+    elif _env_val in {"1", "true", "yes"}:
         want_graph = True
-    if isinstance(runtime, dict) and runtime.get("useGraph"):
-        want_graph = True
+    if isinstance(runtime, dict) and "useGraph" in runtime:
+        want_graph = bool(runtime.get("useGraph"))
     if want_graph:
         try:
             from minicode.graph import run_graph_turn as _graph_run

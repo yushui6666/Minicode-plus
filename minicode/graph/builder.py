@@ -281,7 +281,7 @@ def _authorize_node(
     return {"permission": "allowed"}
 
 
-def _model_step_kernel(state: AgentState, next_step: StepProvider) -> dict[str, Any]:
+def _model_step_kernel(state: AgentState, next_step: StepProvider, sink: GraphEventSink | None = None) -> dict[str, Any]:
     """Flatten one AgentStep into plain fields; keep content messages.
 
     Tool steps keep the whole ``calls`` list in ``step_calls`` — the batch
@@ -312,6 +312,11 @@ def _model_step_kernel(state: AgentState, next_step: StepProvider) -> dict[str, 
         updates["tool_input"] = call["input"]
         if step.content.strip():
             if step.contentKind == "progress":
+                if sink is not None:
+                    try:
+                        sink.progress(step.content)
+                    except Exception:
+                        pass
                 updates["messages"] = state.get("messages", []) + [
                     {"role": "assistant_progress", "content": step.content},
                     {"role": "user", "content": NUDGE_CONTINUE},
@@ -430,6 +435,12 @@ def _assistant_followup_node(state: AgentState, sink: GraphEventSink) -> dict[st
                     ),
                 )
             )
+            # Legacy emit_runtime_event also forwarded to progress (emit_progress=True)
+            # so progress subscribers see recovery/guard messages (pause_turn, verification guard).
+            try:
+                sink.progress(assistant_content)
+            except Exception:
+                pass
         else:
             sink.progress(assistant_content)
         messages.append(
@@ -714,7 +725,7 @@ def build_model_graph(
     graph.add_node("compact", lambda state: (compact_context(state) if compact_context else {"compacted": False}))
 
     graph.add_node("step_policy", lambda state: _step_policy_node(state, sink))
-    graph.add_node("model", lambda state: _model_step_kernel(state, next_step))
+    graph.add_node("model", lambda state: _model_step_kernel(state, next_step, sink))
     graph.add_node("classify_step", _classify_step_node)
     graph.add_node(
         "assistant_followup", lambda state: _assistant_followup_node(state, sink)
