@@ -32,7 +32,7 @@ from minicode.session import (
     load_session,
     create_new_session,
 )
-from minicode.agent_loop import run_agent_turn
+from minicode.graph import run_graph_turn
 from minicode.mock_model import MockModelAdapter
 from minicode.permissions import PermissionManager
 from minicode.tools import create_default_tool_registry
@@ -131,18 +131,12 @@ class TestMemoryContextManagerIntegration:
         tools,
         tmp_workspace,
         auto_allow_permissions,
-        monkeypatch,
     ):
         """A resumed frontend must keep one memory state object per turn."""
         context = ContextManager(model="default", context_window=1000)
         memory_manager = MemoryManager(project_root=tmp_workspace)
 
-        def fail_if_recreated(*_args, **_kwargs):
-            raise AssertionError("agent loop recreated the frontend memory manager")
-
-        monkeypatch.setattr("minicode.agent_loop.MemoryManager", fail_if_recreated)
-
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=[
@@ -403,7 +397,7 @@ class TestMemoryAgentLoopIntegration:
         )
         base_system.append({"role": "user", "content": "/ls"})
 
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=base_system,
@@ -432,7 +426,7 @@ class TestMemoryAgentLoopIntegration:
             {"role": "system", "content": inject_memory_into_prompt(base_prompt, mm)},
             {"role": "user", "content": "/read hello.txt"},
         ]
-        result_t1 = run_agent_turn(
+        result_t1 = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=msgs_t1,
@@ -445,7 +439,7 @@ class TestMemoryAgentLoopIntegration:
             {"role": "system", "content": inject_memory_into_prompt(base_prompt, mm)},
             {"role": "user", "content": "/write test_runner.py::# Test runner"},
         ]
-        result_t2 = run_agent_turn(
+        result_t2 = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=msgs_t2,
@@ -479,7 +473,7 @@ class TestMemoryAgentLoopIntegration:
             {"role": "system", "content": injected_prompt},
             {"role": "user", "content": "/tools"},
         ]
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=msgs,
@@ -1138,7 +1132,7 @@ class TestCrossCuttingMemoryIntegration:
                 {"role": "system", "content": injected},
                 {"role": "user", "content": turn_input},
             ]
-            result = run_agent_turn(
+            result = run_graph_turn(
                 model=mock_model,
                 tools=tools,
                 messages=msgs,

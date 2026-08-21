@@ -212,28 +212,27 @@ def _tool_executor(
     await_user: bool = False,
 ):
     def execute(state: AgentState) -> dict:
+        # The observe node owns message pairs since slice 3; this executor
+        # reports a plain batch result like the production runtime closure.
         executed.append(state["tool_name"])
-        messages = state.get("messages", []) + [
-            {
-                "role": "assistant_tool_call",
-                "toolUseId": state.get("tool_call_id", ""),
-                "toolName": state["tool_name"],
-                "input": state.get("tool_input", {}),
-            },
-            {
-                "role": "tool_result",
-                "toolUseId": state.get("tool_call_id", ""),
-                "toolName": state["tool_name"],
-                "content": output,
-                "isError": not ok,
-            },
-        ]
         return {
+            "tool_results_batch": [
+                {
+                    "id": state.get("tool_call_id", ""),
+                    "toolName": state["tool_name"],
+                    "input": state.get("tool_input", {}),
+                    "ok": ok,
+                    "output": output,
+                    "content": output,
+                    "awaitUser": await_user,
+                    "concurrent": False,
+                }
+            ],
             "tool_result": output,
             "tool_result_ok": ok,
             "tool_await_user": await_user,
             "tool_summary": f"{state['tool_name']}: {output[:200]}",
-            "messages": messages,
+            "messages": state.get("messages", []),
         }
 
     return execute
@@ -245,7 +244,6 @@ def _kernel_graph(steps, executed, sink, **initial_overrides):
         next_step=lambda state: next(scripted),
         execute_tool=_tool_executor(executed),
         event_sink=sink,
-        turn_kernel=True,
     )
     return graph, _kernel_initial(**initial_overrides)
 
@@ -449,7 +447,6 @@ def test_kernel_await_user_tool_pauses_turn():
             executed, output="read_file: needs your input", await_user=True
         ),
         event_sink=sink,
-        turn_kernel=True,
     )
     result = graph.invoke(_kernel_initial())
 
@@ -470,7 +467,6 @@ def test_kernel_state_is_checkpoint_serializable():
         next_step=lambda state: next(scripted),
         execute_tool=_tool_executor(executed),
         event_sink=sink,
-        turn_kernel=True,
         checkpointer=InMemorySaver(),
     )
     config = {"configurable": {"thread_id": "kernel-thread"}}
@@ -494,28 +490,6 @@ def test_kernel_state_is_checkpoint_serializable():
         assert snapshot[key] is None or isinstance(snapshot[key], (int, bool, str)), key
     assert isinstance(snapshot["messages"], list)
     assert result["stop_reason"] == "done"
-
-
-def test_thin_topology_escape_hatch_preserves_slice1_behavior():
-    executed: list[str] = []
-    sink, events, _progress, _assistant, _protected = _recording_sink()
-    scripted = iter(
-        [
-            AgentStep(type="assistant", content=""),
-            AgentStep(type="assistant", content="done", kind="final"),
-        ]
-    )
-    graph = build_model_graph(
-        next_step=lambda state: next(scripted),
-        execute_tool=_tool_executor(executed),
-        event_sink=sink,
-        turn_kernel=False,
-    )
-    result = graph.invoke({"messages": [], "status": "running"})
-
-    assert {"role": "assistant_progress", "content": ""} in result["messages"]
-    assert result["status"] == "completed"
-    assert events == []  # the thin topology never touches the event sink
 
 
 def test_single_profile_keeps_widening_dormant():

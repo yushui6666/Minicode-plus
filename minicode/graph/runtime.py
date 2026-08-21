@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import concurrent.futures
+import os
 import sqlite3
 from typing import Any
 
 from langgraph.checkpoint.sqlite import SqliteSaver
+from minicode.agent_intelligence import ToolScheduler
 from minicode.config import MINI_CODE_DIR
 from minicode.graph.builder import (
     AgentState,
@@ -11,18 +14,70 @@ from minicode.graph.builder import (
     build_model_graph,
 )
 from minicode.runtime_profiles import resolve_runtime_profile
-from minicode.tooling import ToolContext, ToolRegistry
+from minicode.tooling import ToolContext, ToolRegistry, ToolResult
 from minicode.types import AgentStep, ChatMessage, ModelAdapter, RuntimeEvent
 from minicode.working_memory import protect_context
 
 
-def _kernel_topology_enabled(runtime: dict | None) -> bool:
-    """The turn-kernel topology is the default; ``turnKernel=thin`` is the
-    escape hatch back to the slice-1 topology (removed in migration slice 3)."""
+def _execute_single_tool(
+    call: dict[str, Any],
+    tools: ToolRegistry,
+    cwd: str,
+    permissions: Any | None,
+    session: Any | None,
+    runtime: dict | None,
+    tool_scheduler: ToolScheduler | None = None,
+) -> ToolResult:
+    """Execute one tool call with timeout protection and a crash safety net.
 
-    if not runtime:
-        return True
-    return str(runtime.get("turnKernel", "")).strip().lower() != "thin"
+    Port of the retired loop's worker function (``agent_loop._execute_single_tool``
+    minus hooks/store/metrics): any unexpected crash in the execution pipeline
+    is converted to an error ``ToolResult`` instead of killing the graph turn.
+    """
+
+    tool_name = call["toolName"]
+    tool_input = call["input"]
+    base_timeout = int(os.environ.get("MINICODE_TOOL_TIMEOUT", "120"))
+    tool_timeout = int(
+        getattr(tool_scheduler, "_force_tool_timeout", base_timeout)
+    )
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                tools.execute,
+                tool_name,
+                tool_input,
+                ToolContext(
+                    cwd=cwd,
+                    permissions=permissions,
+                    session=session,
+                    _runtime=runtime,
+                ),
+            )
+            try:
+                return future.result(timeout=tool_timeout)
+            except concurrent.futures.TimeoutError:
+                return ToolResult(
+                    ok=False,
+                    output=f"Tool '{tool_name}' timed out after {tool_timeout}s",
+                )
+    except Exception as exc:  # noqa: BLE001 - a tool crash must not kill the turn
+        try:
+            return tools.execute(
+                tool_name,
+                tool_input,
+                ToolContext(
+                    cwd=cwd,
+                    permissions=permissions,
+                    session=session,
+                    _runtime=runtime,
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            return ToolResult(
+                ok=False,
+                output=f"Tool '{tool_name}' crashed: {type(exc).__name__}",
+            )
 
 
 def run_graph_turn(
@@ -51,15 +106,25 @@ def run_graph_turn(
     on_progress_message: Any | None = None,
     on_runtime_event: Any | None = None,
 ) -> list[ChatMessage]:
-    """Run one model/tool turn through LangGraph using existing adapters."""
+    """Run one model/tool turn through LangGraph using existing adapters.
+
+    ``runtime={"turnKernel": "thin"}`` is accepted but ignored: the slice-1
+    thin topology escape hatch was removed in migration slice 3.
+    """
 
     profile = resolve_runtime_profile(runtime, fallback_max_steps=max_steps)
     effective_max_steps = int(profile.max_steps or max_steps)
-    kernel_enabled = _kernel_topology_enabled(runtime)
 
     def emit_runtime(event: RuntimeEvent) -> None:
         if on_runtime_event is not None:
             on_runtime_event(event)
+            return
+        # Fall back to a Rust-shaped callbacks object (e.g. TurnEventQueue)
+        # so checkpointed TUI turns surface phase/widening/stop events.
+        if callbacks is not None:
+            handler = getattr(callbacks, "on_runtime_event", None)
+            if handler:
+                handler(event)
 
     if load_context is None and memory_manager is not None:
         def load_context(state: AgentState) -> str:
@@ -95,146 +160,205 @@ def run_graph_turn(
                 return {"messages": compacted_messages, "compacted": True}
             return {"compacted": False}
 
-    if kernel_enabled:
-        # Kernel topology: nodes own progress/assistant callbacks, so the
-        # provider stays a pure AgentStep source (streaming still happens
-        # inside the adapter). The thin topology keeps the slice-1 closure
-        # behavior, including its immediate progress/stop event emission.
-        def next_step(state: AgentState) -> AgentStep:
+    # Kernel topology: nodes own progress/assistant callbacks, so the
+    # provider stays a pure AgentStep source (streaming still happens
+    # inside the adapter). Model API failures degrade gracefully — the
+    # retired loop caught provider exceptions and returned a typed
+    # fallback message instead of crashing the turn.
+    def next_step(state: AgentState) -> AgentStep:
+        try:
             return model.next(state.get("messages", []))
-    else:
-        steps = 0
-        widened = False
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except ConnectionError as error:
+            fallback = f"Network error (connection failed or dropped): {error}"
+        except TimeoutError as error:
+            fallback = f"Model API timeout: {error}"
+        except Exception as error:  # noqa: BLE001 - provider failures must not crash the turn
+            text = str(error)
+            lowered = text.lower()
+            # Keep the headless CI guidance for provider-channel failures
+            # inside the turn fallback so run_headless can surface it without
+            # relying on an exception bubbling out of the graph.
+            if "no available channel" in lowered or "provider unavailable" in lowered:
+                fallback = (
+                    f"Provider availability failure: {text}. "
+                    "Configure a fallback model or provider channel and retry."
+                )
+            else:
+                fallback = f"Model API error ({type(error).__name__}): {text}"
+        return AgentStep(type="assistant", content=fallback, kind="error")
 
-        def next_step(state: AgentState) -> AgentStep:
-            nonlocal steps, widened
-            if steps >= effective_max_steps:
-                emit_runtime(
-                    RuntimeEvent(
-                        category="stop",
-                        message="Reached the maximum tool step limit.",
-                        step=steps,
-                        profile=profile.name,
-                        stop_reason="max_steps",
-                    )
-                )
-                return AgentStep(
-                    type="assistant",
-                    content="Reached the maximum tool step limit.",
-                    kind="final",
-                )
-            steps += 1
-            if (
-                not widened
-                and profile.widen_after_step is not None
-                and steps >= profile.widen_after_step
-            ):
-                widened = True
-                emit_runtime(
-                    RuntimeEvent(
-                        category="widening",
-                        message="Runtime widened the search budget.",
-                        step=steps,
-                        profile=profile.name,
-                        widening_reason="step-threshold",
-                    )
-                )
-            step = model.next(state.get("messages", []))
-            if step.kind == "progress":
-                if on_progress_message is not None:
-                    on_progress_message(step.content)
-            elif step.type == "assistant" and step.content.strip():
-                emit_runtime(
-                    RuntimeEvent(
-                        category="stop",
-                        message="Agent turn completed.",
-                        step=steps,
-                        profile=profile.name,
-                        stop_reason="done",
-                    )
-                )
-            if callbacks is not None and step.type == "assistant":
-                handler = getattr(callbacks, "on_assistant_message", None)
-                if handler:
-                    handler(step.content)
-            if on_assistant_message is not None and step.type == "assistant":
-                on_assistant_message(step.content)
-            return step
+    def _fire_tool_start(tool_name: str, tool_input: dict[str, Any]) -> None:
+        if callbacks is not None:
+            handler = getattr(callbacks, "on_tool_start", None)
+            if handler:
+                handler(tool_name, tool_input)
+        if on_tool_start is not None:
+            on_tool_start(tool_name, tool_input)
 
-    if kernel_enabled:
-        def execute_tool(state: AgentState) -> dict[str, Any]:
-            tool_name = state["tool_name"]
-            tool_input = state.get("tool_input", {})
-            tool_call_id = str(state.get("tool_call_id", "") or "")
-            if callbacks is not None:
-                handler = getattr(callbacks, "on_tool_start", None)
-                if handler:
-                    handler(tool_name, tool_input)
-            if on_tool_start is not None:
-                on_tool_start(tool_name, tool_input)
-            result = tools.execute(
-                tool_name,
-                tool_input,
-                ToolContext(cwd=cwd, permissions=permissions, session=session),
+    def _fire_tool_result(tool_name: str, output: str, is_error: bool) -> None:
+        if callbacks is not None:
+            handler = getattr(callbacks, "on_tool_result", None)
+            if handler:
+                handler(tool_name, output, is_error)
+        if on_tool_result is not None:
+            on_tool_result(tool_name, output, is_error)
+
+    def _noted_output(tool_name: str, result: ToolResult) -> str:
+        if result.ok:
+            return result.output
+        return (
+            f"{result.output}\n\n[System note: tool '{tool_name}' failed; "
+            "check the input, adjust the approach, or report the blocker.]"
+        )
+
+    tool_scheduler = ToolScheduler()
+
+    def _batch_entry(call: dict[str, Any], result: ToolResult, concurrent: bool) -> dict[str, Any]:
+        return {
+            "id": str(call.get("id", "") or ""),
+            "toolName": call["toolName"],
+            "input": call["input"],
+            "ok": result.ok,
+            "output": result.output,
+            "content": _noted_output(call["toolName"], result),
+            "awaitUser": bool(getattr(result, "awaitUser", False)),
+            "concurrent": concurrent,
+        }
+
+    def execute_tool(state: AgentState) -> dict[str, Any]:
+        """Execute every pending call, replicating the retired loop's
+        ToolScheduler phases: parallel for concurrency-safe calls, in-order
+        serial for the rest (early break on awaitUser), results re-sorted to
+        the model's original call order. Message pairs are NOT appended here
+        — the observe node owns them so an await_user short-circuit can skip
+        later pairs."""
+
+        calls = [
+            dict(call)
+            for call in (state.get("step_calls") or [])
+            if call.get("toolName")
+        ]
+        if not calls:
+            # classify_step only routes tool steps with calls; keep a legacy
+            # fallback for the singular fields just in case.
+            calls = [
+                {
+                    "id": state.get("tool_call_id", ""),
+                    "toolName": state.get("tool_name", ""),
+                    "input": state.get("tool_input", {}),
+                }
+            ]
+
+        results: list[tuple[dict[str, Any], ToolResult]] = []
+        concurrent_ids: set[int] = set()
+
+        if len(calls) <= 1:
+            call = calls[0]
+            _fire_tool_start(call["toolName"], call["input"])
+            result = _execute_single_tool(
+                call, tools, cwd, permissions, session, runtime, tool_scheduler
             )
-            if callbacks is not None:
-                handler = getattr(callbacks, "on_tool_result", None)
-                if handler:
-                    handler(tool_name, result.output, not result.ok)
-            if on_tool_result is not None:
-                on_tool_result(tool_name, result.output, not result.ok)
-            result_output = result.output
-            if not result.ok:
-                result_output = (
-                    f"{result.output}\n\n[System note: tool '{tool_name}' failed; "
-                    "check the input, adjust the approach, or report the blocker.]"
+            _fire_tool_result(call["toolName"], result.output, not result.ok)
+            results.append((call, result))
+        else:
+            concurrent_calls, serial_calls = tool_scheduler.schedule_calls(calls, tools)
+            concurrent_ids = {id(call) for call in concurrent_calls}
+
+            if concurrent_calls:
+                step = int(state.get("step", 0) or 0)
+                tool_error_count = int(state.get("tool_error_count", 0) or 0)
+                max_workers = tool_scheduler.get_recommended_max_workers(
+                    concurrent_calls,
+                    error_rate=tool_error_count / max(step, 1),
+                    avg_latency=step * 2.0,
+                    recent_failures=tool_error_count,
                 )
-            return {
-                "tool_result": result_output,
-                "tool_result_ok": result.ok,
-                "tool_await_user": bool(getattr(result, "awaitUser", False)),
-                "tool_summary": f"{tool_name}: {result.output[:200]}",
-                "messages": state.get("messages", [])
-                + [
-                    {
-                        "role": "assistant_tool_call",
-                        "toolUseId": tool_call_id,
-                        "toolName": tool_name,
-                        "input": tool_input,
-                    },
-                    {
-                        "role": "tool_result",
-                        "toolUseId": tool_call_id,
-                        "toolName": tool_name,
-                        "content": result_output,
-                        "isError": not result.ok,
-                    },
-                ],
-            }
-    else:
-        def execute_tool(state: AgentState) -> dict[str, Any]:
-            if callbacks is not None:
-                handler = getattr(callbacks, "on_tool_start", None)
-                if handler:
-                    handler(state["tool_name"], state.get("tool_input", {}))
-            if on_tool_start is not None:
-                on_tool_start(state["tool_name"], state.get("tool_input", {}))
-            result = tools.execute(
-                state["tool_name"],
-                state.get("tool_input", {}),
-                ToolContext(cwd=cwd, permissions=permissions, session=session),
-            )
-            if callbacks is not None:
-                handler = getattr(callbacks, "on_tool_result", None)
-                if handler:
-                    handler(state["tool_name"], result.output, not result.ok)
-            if on_tool_result is not None:
-                on_tool_result(state["tool_name"], result.output, not result.ok)
-            return {
-                "tool_result": result.output,
-                "messages": state.get("messages", [])
-                + [{"role": "tool_result", "content": result.output, "toolName": state["tool_name"]}],
-            }
+                # Cybernetic concurrency cap (FeedbackController) pokes this
+                # attribute when wired — honor it when present.
+                force_cap = getattr(tool_scheduler, "_force_max_workers", None)
+                if force_cap:
+                    max_workers = min(max_workers, int(force_cap))
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max_workers,
+                    thread_name_prefix="mc-tool",
+                ) as pool:
+                    future_to_call = {
+                        pool.submit(
+                            _execute_single_tool,
+                            call,
+                            tools,
+                            cwd,
+                            permissions,
+                            session,
+                            runtime,
+                            tool_scheduler,
+                        ): call
+                        for call in concurrent_calls
+                    }
+                    # No UI callbacks during the concurrent phase — they are
+                    # deferred to the observe node in original call order.
+                    for future in concurrent.futures.as_completed(future_to_call):
+                        call = future_to_call[future]
+                        try:
+                            result = future.result()
+                        except Exception as exc:  # noqa: BLE001
+                            result = ToolResult(
+                                ok=False,
+                                output=f"Concurrent execution error: {exc}",
+                            )
+                        results.append((call, result))
+
+            for call in serial_calls:
+                _fire_tool_start(call["toolName"], call["input"])
+                result = _execute_single_tool(
+                    call, tools, cwd, permissions, session, runtime, tool_scheduler
+                )
+                _fire_tool_result(call["toolName"], result.output, not result.ok)
+                results.append((call, result))
+                # If a serial tool awaits the user, stop launching the rest —
+                # already-computed results still flow through for messages.
+                if result.awaitUser:
+                    break
+
+            # Pairwise conflict recording for co-failures, in both directions
+            # (the retired loop recorded each ordered pair, so one co-failed
+            # batch reaches the conflict threshold immediately).
+            for call, result in results:
+                if not result.ok:
+                    for other_call, other_result in results:
+                        if other_call.get("id") == call.get("id"):
+                            continue
+                        if not other_result.ok:
+                            tool_scheduler.record_conflict(
+                                call["toolName"], other_call["toolName"]
+                            )
+
+        # Results always flow back in the model's original call order.
+        call_order = {call.get("id", ""): idx for idx, call in enumerate(calls)}
+        results.sort(key=lambda pair: call_order.get(pair[0].get("id", ""), 999))
+        batch = [
+            _batch_entry(call, result, concurrent=id(call) in concurrent_ids)
+            for call, result in results
+        ]
+        last_call, last_result = results[-1] if results else (None, ToolResult(ok=True, output=""))
+        return {
+            "tool_results_batch": batch,
+            "tool_result": (
+                _noted_output(last_call["toolName"], last_result) if last_call else ""
+            ),
+            "tool_result_ok": all(result.ok for _, result in results),
+            "tool_await_user": any(
+                bool(getattr(result, "awaitUser", False)) for _, result in results
+            ),
+            "tool_summary": (
+                f"{last_call['toolName']}: {last_result.output[:200]}"
+                if last_call
+                else ""
+            ),
+            "messages": state.get("messages", []),
+        }
 
     def sink_assistant(content: str) -> None:
         if callbacks is not None:
@@ -261,9 +385,11 @@ def run_graph_turn(
 
     event_sink = GraphEventSink(
         on_runtime_event=emit_runtime,
-        on_progress_message=sink_progress if kernel_enabled else None,
-        on_assistant_message=sink_assistant if kernel_enabled else None,
-        on_protect_final_answer=sink_protect_final if kernel_enabled else None,
+        on_progress_message=sink_progress,
+        on_assistant_message=sink_assistant,
+        on_protect_final_answer=sink_protect_final,
+        on_tool_start=_fire_tool_start,
+        on_tool_result=_fire_tool_result,
     )
 
     emit_runtime(
@@ -298,23 +424,58 @@ def run_graph_turn(
             compact_context=compact_context,
             repair=repair,
             event_sink=event_sink,
-            turn_kernel=kernel_enabled,
         )
         initial_state: dict[str, Any] = {"messages": messages, "status": "running"}
-        if kernel_enabled:
-            initial_state.update(
-                {
-                    "profile_name": profile.name,
-                    "max_steps": effective_max_steps,
-                    "widen_after_step": profile.widen_after_step,
-                    "widening_step_bonus": profile.widening_step_bonus,
-                    "empty_response_retry_limit": profile.empty_response_retry_limit,
-                    "recoverable_thinking_retry_limit": (
-                        profile.recoverable_thinking_retry_limit
-                    ),
-                    "verification_strict": profile.strict_step_verification,
-                }
-            )
+        initial_state.update(
+            {
+                "profile_name": profile.name,
+                "max_steps": effective_max_steps,
+                "widen_after_step": profile.widen_after_step,
+                "widening_step_bonus": profile.widening_step_bonus,
+                "empty_response_retry_limit": profile.empty_response_retry_limit,
+                "recoverable_thinking_retry_limit": (
+                    profile.recoverable_thinking_retry_limit
+                ),
+                "verification_strict": profile.strict_step_verification,
+            }
+        )
+        # Checkpointed threads continue from the previous turn's channel
+        # values — every per-turn channel must be reset here or turn 2
+        # inherits turn 1's stop_reason/decision fields and finalizes
+        # immediately without calling the model (slice-3 defect fix).
+        # Keep this key set in sync with turn_state_to_snapshot() plus the
+        # decision/step/batch fields.
+        initial_state.update(
+            {
+                "step": 0,
+                "stop_reason": None,
+                "stop_event_emitted": False,
+                "saw_tool_result": False,
+                "tool_error_count": 0,
+                "tool_observation_count": 0,
+                "successful_tool_observation_count": 0,
+                "empty_response_retry_count": 0,
+                "recoverable_thinking_retry_count": 0,
+                "widening_active": False,
+                "widening_transition_count": 0,
+                "widening_trigger_reason": "",
+                "widening_trigger_evidence": "",
+                "latest_tool_result_summary": "",
+                "progress_summary": "",
+                "tool_result_ok": True,
+                "tool_await_user": False,
+                "step_type": "assistant",
+                "step_content": "",
+                "step_calls": [],
+                "tool_results_batch": [],
+                "decision_kind": "",
+                "decision_assistant_content": "",
+                "decision_user_content": "",
+                "decision_stop_reason": "",
+                "decision_event_category": "",
+                "decision_route": "model",
+            }
+        )
         config: dict[str, Any] | None = None
         if effective_checkpointer:
             config = {"configurable": {"thread_id": effective_thread_id}}

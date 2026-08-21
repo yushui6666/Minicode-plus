@@ -60,3 +60,52 @@ environment noise, documented here for the next runner).
 - [x] Verify with
   `.venv/bin/python -m pytest tests/test_langgraph_runtime.py -q` (18 passed)
   plus the focused legacy regression set (147 passed).
+
+### Task 5: Multi-tool batch, graceful model failures, and slice-3 hardening
+
+**Files:** `minicode/graph/builder.py`, `minicode/graph/runtime.py`,
+`minicode/turn_kernel.py`, `minicode/turn_events.py`,
+`tests/test_graph_multi_tool.py`, `tests/test_langgraph_runtime.py`,
+`tests/test_headless.py`
+
+- [x] Port ToolScheduler batch semantics into the graph runtime: whole
+  `step.calls` list in `step_calls`, concurrent/serial split, parallel phase
+  with timeout guard, ordered `assistant_tool_call`/`tool_result` pairs in
+  `observe_tool`, `await_user` short-circuit, co-failure conflict recording,
+  deferred `on_tool_start`/`on_tool_result` via `GraphEventSink` adapters
+  (`minicode/graph/builder.py:502`, `minicode/graph/runtime.py:219`).
+- [x] Add `ToolScheduler` integration to `run_graph_turn` (per-call
+  `ToolContext`, timeout via `MINICODE_TOOL_TIMEOUT`, crash safety net,
+  `get_recommended_max_workers` + `_force_max_workers` cap, call-order sort;
+  `minicode/graph/runtime.py:22`).
+- [x] Remove the slice-1 thin topology escape hatch (`turnKernel=False`):
+  `build_model_graph` is now the single topology, `runtime={"turnKernel":…}`
+  is accepted but ignored (`minicode/graph/builder.py:707`,
+  `minicode/graph/runtime.py:111`, thin test deleted).
+- [x] Graceful model-API failure: `run_graph_turn` catches provider
+  exceptions in `next_step` and emits a typed `kind="error"` fallback
+  (`ConnectionError`→network, `TimeoutError`→timeout,
+  `no available channel`→`Provider availability failure` with fallback
+  guidance, otherwise `Model API error`) routed through
+  `classify_step` to a `blocked` stop (`minicode/graph/runtime.py:168`,
+  `minicode/graph/builder.py:343`).
+- [x] Per-turn channel reset for checkpointed threads: `initial_state`
+  zeroes `stop_reason`, decision/step/batch fields before each
+  `graph.invoke` so turn 2 on the same `thread_id` calls the model
+  (`minicode/graph/runtime.py:437`).
+- [x] `TurnEventQueue` as `AgentTurnCallbacks`: add `on_tool_start`,
+  `on_tool_result`, `on_assistant_message`, `on_progress_message`,
+  `on_runtime_event` adapters that publish `TurnEvent`s; `GraphEventSink`
+  defers concurrent callbacks to `observe_tool` so the TUI sees them in
+  original call order (`minicode/turn_events.py:198`,
+  `minicode/graph/builder.py:144`).
+- [x] Progress summary and coda: `turn_kernel` round-trips
+  `progress_summary` (`minicode/turn_kernel.py:934`), `observe_tool`
+  records `decide_tool_turn(...).progress_summary`,
+  `test_observe_progress_summary_round_trips_into_coda` pins it
+  (`tests/test_graph_multi_tool.py:574`).
+- [x] Verify: `tests/test_langgraph_runtime.py` (18) +
+  `tests/test_graph_multi_tool.py` (15) = 33 passed;
+  `tests/test_headless.py::test_run_headless_provider_failure_uses_runtime_channel_details`
+  was failing against the new fallback path (fixed by provider-channel
+  detection in `runtime.py:178`); full suite 1424 passed, 2 skipped.

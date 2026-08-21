@@ -72,9 +72,13 @@ class AgentState(TypedDict, total=False):
     tool_observation_count: int
     successful_tool_observation_count: int
     latest_tool_result_summary: str
+    progress_summary: str
     tool_result_ok: bool
     tool_await_user: bool
     tool_summary: str
+    # ── turn kernel: multi-call batches (slice 3) ──────────────────────────
+    step_calls: list[dict[str, Any]]
+    tool_results_batch: list[dict[str, Any]]
     # ── turn kernel: widening ──────────────────────────────────────────────
     widening_active: bool
     widening_transition_count: int
@@ -129,13 +133,17 @@ class GraphEventSink:
     The LangGraph runtime injects the production sink; tests inject fakes.
     Node event semantics mirror the retired loop's ``emit_runtime_event``:
     ``phase``/``widening`` events also drive the progress channel, ``stop``
-    and ``guard`` do not.
+    and ``guard`` do not. The tool seams carry the *deferred* callbacks for
+    concurrency-safe tools whose execution ran inside the parallel phase —
+    serial tools fire their callbacks at execution time in the runtime.
     """
 
     on_runtime_event: Callable[[RuntimeEvent], None] | None = None
     on_progress_message: Callable[[str], None] | None = None
     on_assistant_message: Callable[[str], None] | None = None
     on_protect_final_answer: Callable[[str], None] | None = None
+    on_tool_start: Callable[[str, dict[str, Any]], None] | None = None
+    on_tool_result: Callable[[str, str, bool], None] | None = None
 
     def emit_runtime(self, event: RuntimeEvent) -> None:
         if self.on_runtime_event is not None:
@@ -152,6 +160,14 @@ class GraphEventSink:
     def protect_final(self, content: str) -> None:
         if self.on_protect_final_answer is not None:
             self.on_protect_final_answer(content)
+
+    def tool_start(self, tool_name: str, tool_input: dict[str, Any]) -> None:
+        if self.on_tool_start is not None:
+            self.on_tool_start(tool_name, tool_input)
+
+    def tool_result(self, tool_name: str, output: str, is_error: bool) -> None:
+        if self.on_tool_result is not None:
+            self.on_tool_result(tool_name, output, is_error)
 
 
 _NOOP_SINK = GraphEventSink()
@@ -183,32 +199,6 @@ def _finalize(_: AgentState) -> dict[str, Any]:
 
 def _permission_route(state: AgentState) -> str:
     return "execute_tool" if state.get("permission", "allowed") == "allowed" else "finalize"
-
-
-def _verification_route(state: AgentState) -> str:
-    return "repair" if state.get("repair_requested") else "model"
-
-
-def _model_step(state: AgentState, next_step: StepProvider) -> dict[str, Any]:
-    step = next_step(state)
-    if step.type == "tool_calls" and step.calls:
-        call = step.calls[0]
-        return {
-            "next_action": "tool",
-            "tool_name": call["toolName"],
-            "tool_input": call["input"],
-            "messages": state.get("messages", []) + [{"role": "assistant", "content": step.content}],
-        }
-    if step.kind == "progress" or not step.content.strip():
-        return {
-            "next_action": "continue",
-            "messages": state.get("messages", [])
-            + [{"role": "assistant_progress", "content": step.content}],
-        }
-    return {
-        "next_action": "complete",
-        "messages": state.get("messages", []) + [{"role": "assistant", "content": step.content}],
-    }
 
 
 # ── Turn-kernel nodes (slice 2) ─────────────────────────────────────────────
@@ -271,8 +261,33 @@ def _loop_route(state: AgentState) -> str:
     return "finalize" if state.get("stop_reason") else "model"
 
 
+def _authorize_node(
+    state: AgentState,
+    authorize_tool: Callable[[AgentState], Literal["allowed", "denied", "pending"]] | None,
+) -> dict[str, Any]:
+    """Authorize every pending call; one denial denies the batch."""
+
+    if authorize_tool is None:
+        return {"permission": "allowed"}
+    for call in state.get("step_calls", []):
+        call_view: AgentState = {
+            **state,
+            "tool_call_id": call.get("id", ""),
+            "tool_name": call["toolName"],
+            "tool_input": call["input"],
+        }
+        if authorize_tool(call_view) != "allowed":
+            return {"permission": "denied"}
+    return {"permission": "allowed"}
+
+
 def _model_step_kernel(state: AgentState, next_step: StepProvider) -> dict[str, Any]:
-    """Flatten one AgentStep into plain fields; keep content messages."""
+    """Flatten one AgentStep into plain fields; keep content messages.
+
+    Tool steps keep the whole ``calls`` list in ``step_calls`` — the batch
+    executor runs every call (slice 3); the singular fields stay populated
+    from the first call for debugging and the slice-1 demo graph.
+    """
 
     step = next_step(state)
     updates: dict[str, Any] = {
@@ -282,6 +297,7 @@ def _model_step_kernel(state: AgentState, next_step: StepProvider) -> dict[str, 
         "step_stop_reason": None,
         "step_block_types": [],
         "step_ignored_block_types": [],
+        "step_calls": [],
     }
     diagnostics = getattr(step, "diagnostics", None)
     if diagnostics is not None:
@@ -289,6 +305,7 @@ def _model_step_kernel(state: AgentState, next_step: StepProvider) -> dict[str, 
         updates["step_block_types"] = list(diagnostics.blockTypes or [])
         updates["step_ignored_block_types"] = list(diagnostics.ignoredBlockTypes or [])
     if step.type == "tool_calls" and step.calls:
+        updates["step_calls"] = [dict(call) for call in step.calls]
         call = step.calls[0]
         updates["tool_call_id"] = call.get("id", "")
         updates["tool_name"] = call["toolName"]
@@ -308,7 +325,10 @@ def _model_step_kernel(state: AgentState, next_step: StepProvider) -> dict[str, 
 
 def _classify_step_node(state: AgentState) -> dict[str, Any]:
     """Decision hub: route tool steps to authorize, assistant steps through
-    ``decide_assistant_turn`` (retry counters ride the snapshot write-back)."""
+    ``decide_assistant_turn`` (retry counters ride the snapshot write-back).
+    Provider failures arrive as ``kind="error"`` steps and resolve to a
+    typed blocked stop with the fallback message, mirroring the retired
+    loop's model-API error handling."""
 
     if state.get("step_type") == "tool_calls":
         return {
@@ -317,6 +337,16 @@ def _classify_step_node(state: AgentState) -> dict[str, Any]:
             "decision_assistant_content": "",
             "decision_user_content": "",
             "decision_stop_reason": "",
+            "decision_event_category": "",
+        }
+
+    if state.get("step_kind") == "error":
+        return {
+            "decision_kind": "fallback",
+            "decision_route": "finalize",
+            "decision_assistant_content": state.get("step_content", ""),
+            "decision_user_content": "",
+            "decision_stop_reason": "blocked",
             "decision_event_category": "",
         }
 
@@ -480,43 +510,108 @@ def _execute_tool_kernel(state: AgentState, execute_tool: ToolExecutor) -> dict[
         "tool_summary",
         f"{state.get('tool_name', 'tool')}: {str(updates.get('tool_result', ''))[:200]}",
     )
+    if not updates.get("tool_results_batch"):
+        # Legacy single-call executors (and the slice-1 demo graph fakes)
+        # return singular fields only — normalize into a one-entry batch so
+        # the observe node sees one shape. ``tool_result`` already carries
+        # the noted output in that contract.
+        noted = str(updates.get("tool_result", ""))
+        updates["tool_results_batch"] = [
+            {
+                "id": state.get("tool_call_id", ""),
+                "toolName": state.get("tool_name", ""),
+                "input": state.get("tool_input", {}),
+                "ok": bool(updates.get("tool_result_ok", True)),
+                "output": noted,
+                "content": noted,
+                "awaitUser": bool(updates.get("tool_await_user", False)),
+                "concurrent": False,
+            }
+        ]
     return updates
 
 
 def _observe_tool_node(state: AgentState, sink: GraphEventSink) -> dict[str, Any]:
-    """Record the observation, honor await_user pauses."""
+    """Record observations for every executed call, honor await_user pauses.
+
+    Results are processed in the model's original call order (the executor
+    pre-sorts). Per result: deferred callbacks for concurrent tools, kernel
+    recording, the tool decision, and the ``assistant_tool_call`` +
+    ``tool_result`` message pair. The FIRST await_user decision stops the
+    turn immediately — later calls' pairs are not appended (their tools
+    already ran in the execution phase), mirroring the retired loop.
+    """
 
     turn_state = snapshot_to_turn_state(state)
-    ok = bool(state.get("tool_result_ok", True))
-    summary = state.get("tool_summary", "")
-    turn_state.record_tool_result(ok, summary=summary or None)
-    decision = decide_tool_turn(
-        tool_name=state.get("tool_name", ""),
-        result_output=state.get("tool_result", ""),
-        await_user=bool(state.get("tool_await_user", False)),
-    )
-    updates = turn_state_to_snapshot(turn_state)
-    if decision.kind == "await_user":
-        turn_state.set_stop_reason("await_user")
-        message = decision.assistant_content or state.get("tool_result", "")
-        sink.emit_runtime(
-            RuntimeEvent(
-                category="stop",
-                message=message,
-                step=turn_state.step,
-                profile=turn_state.profile_name,
-                stop_reason="await_user",
-                evidence_summary=turn_state.latest_tool_result_summary,
-            )
+    messages = list(state.get("messages", []))
+    batch = state.get("tool_results_batch", [])
+    updates: dict[str, Any] = {}
+    for entry in batch:
+        tool_name = str(entry.get("toolName", ""))
+        raw_output = str(entry.get("output", ""))
+        noted_output = str(entry.get("content", raw_output))
+        ok = bool(entry.get("ok", True))
+        if entry.get("concurrent"):
+            sink.tool_start(tool_name, dict(entry.get("input", {})))
+        tool_summary = f"{tool_name}: {raw_output[:200]}"
+        turn_state.record_tool_result(ok, summary=tool_summary or None)
+        decision = decide_tool_turn(
+            tool_name=tool_name,
+            result_output=raw_output,
+            await_user=bool(entry.get("awaitUser", False)),
         )
-        sink.assistant(message)
-        updates = turn_state_to_snapshot(turn_state)
-        updates["stop_reason"] = "await_user"
-        updates["stop_event_emitted"] = True
-        updates["messages"] = state.get("messages", []) + [
-            {"role": "assistant", "content": message}
-        ]
-    return updates
+        if decision.progress_summary:
+            turn_state.set_progress_summary(decision.progress_summary)
+        if entry.get("concurrent"):
+            sink.tool_result(tool_name, raw_output, not ok)
+        messages.append(
+            {
+                "role": "assistant_tool_call",
+                "toolUseId": str(entry.get("id", "") or ""),
+                "toolName": tool_name,
+                "input": entry.get("input", {}),
+            }
+        )
+        messages.append(
+            {
+                "role": "tool_result",
+                "toolUseId": str(entry.get("id", "") or ""),
+                "toolName": tool_name,
+                "content": noted_output,
+                "isError": not ok,
+            }
+        )
+        if decision.kind == "await_user":
+            turn_state.set_stop_reason("await_user")
+            message = decision.assistant_content or noted_output
+            sink.emit_runtime(
+                RuntimeEvent(
+                    category="stop",
+                    message=message,
+                    step=turn_state.step,
+                    profile=turn_state.profile_name,
+                    stop_reason="await_user",
+                    evidence_summary=turn_state.latest_tool_result_summary,
+                )
+            )
+            sink.assistant(message)
+            messages.append({"role": "assistant", "content": message})
+            updates = turn_state_to_snapshot(turn_state)
+            updates["stop_reason"] = "await_user"
+            updates["stop_event_emitted"] = True
+            updates["tool_result_ok"] = ok
+            updates["tool_result"] = noted_output
+            updates["tool_summary"] = tool_summary
+            updates["messages"] = messages
+            return updates
+    updates = turn_state_to_snapshot(turn_state)
+    if batch:
+        last = batch[-1]
+        updates["tool_result_ok"] = all(bool(e.get("ok", True)) for e in batch)
+        last_output = str(last.get("content", last.get("output", "")))
+        updates["tool_result"] = last_output
+        updates["tool_summary"] = f"{last.get('toolName', 'tool')}: {str(last.get('output', ''))[:200]}"
+    return {**updates, "messages": messages}
 
 
 def _observe_route(state: AgentState) -> str:
@@ -604,39 +699,19 @@ def build_model_graph(
     compact_context: Callable[[AgentState], dict[str, Any]] | None = None,
     repair: Callable[[AgentState], dict[str, Any]] | None = None,
     event_sink: GraphEventSink | None = None,
-    turn_kernel: bool = False,
 ):
-    """Build the model-driven graph.
+    """Build the model-driven graph with the turn-kernel topology.
 
-    ``turn_kernel=False`` keeps the slice-1 thin topology (the escape hatch
-    selected by ``runtime={"turnKernel": "thin"}``). ``turn_kernel=True``
-    wires the turn-kernel topology: the loop head lives in ``step_policy``,
-    assistant reactions flow through ``classify_step``/``assistant_followup``/
-    ``widen``, and all kernel fields stay plain serializable values.
+    The loop head lives in ``step_policy``, assistant reactions flow through
+    ``classify_step``/``assistant_followup``/``widen``, and all kernel fields
+    stay plain serializable values. The slice-1 thin topology and its
+    ``runtime={"turnKernel": "thin"}`` escape hatch were removed in slice 3.
     """
 
     sink = event_sink or _NOOP_SINK
     graph = StateGraph(AgentState)
     graph.add_node("load_context", lambda state: {"memory_context": load_context(state) if load_context else ""})
     graph.add_node("compact", lambda state: (compact_context(state) if compact_context else {"compacted": False}))
-
-    if not turn_kernel:
-        graph.add_node("model", lambda state: _model_step(state, next_step))
-        graph.add_node("authorize", lambda state: {"permission": authorize_tool(state) if authorize_tool else "allowed"})
-        graph.add_node("execute_tool", lambda state: _execute_tool(state, execute_tool))
-        graph.add_node("verify", _verify)
-        graph.add_node("repair", lambda state: repair(state) if repair else {"status": "failed"})
-        graph.add_node("finalize", _finalize)
-        graph.add_edge(START, "load_context")
-        graph.add_edge("load_context", "compact")
-        graph.add_edge("compact", "model")
-        graph.add_conditional_edges("model", _route)
-        graph.add_edge("execute_tool", "verify")
-        graph.add_conditional_edges("authorize", _permission_route)
-        graph.add_conditional_edges("verify", _verification_route)
-        graph.add_edge("repair", "model")
-        graph.add_edge("finalize", END)
-        return graph.compile(checkpointer=checkpointer)
 
     graph.add_node("step_policy", lambda state: _step_policy_node(state, sink))
     graph.add_node("model", lambda state: _model_step_kernel(state, next_step))
@@ -647,7 +722,7 @@ def build_model_graph(
     graph.add_node("widen", lambda state: _widen_node(state, sink))
     graph.add_node(
         "authorize",
-        lambda state: {"permission": authorize_tool(state) if authorize_tool else "allowed"},
+        lambda state: _authorize_node(state, authorize_tool),
     )
     graph.add_node(
         "execute_tool", lambda state: _execute_tool_kernel(state, execute_tool)

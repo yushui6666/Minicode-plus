@@ -58,17 +58,42 @@ and phase events run exactly once per step.
   pair (with `isError`), fixing sub-agent step accounting in
   `minicode/tools/task.py`.
 
+## Slice 3 (2026-08-21) — multi-tool batch and hardening
+
+Multi-tool calls land as a whole `AgentStep.calls` batch. `run_graph_turn`
+splits them via `ToolScheduler.schedule_calls`: concurrency-safe calls run in
+a `ThreadPoolExecutor` (per-call timeout, crash net), serial calls run
+in-order with early break on `awaitUser`. Both phases sort results back to
+the model's original call order before `observe_tool` appends one
+`assistant_tool_call`/`tool_result` pair per call, honors the first
+`await_user`, records co-failure conflicts (both directions → threshold 2
+serializes the next batch), and defers concurrent `on_tool_start` /
+`on_tool_result` callbacks to preserve original order for the TUI.
+
+Additional hardening: model `ConnectionError`/`TimeoutError`/generic
+exceptions become typed `kind="error"` `AgentStep`s (provider-channel
+`no available channel` maps to `Provider availability failure: … fallback…`,
+otherwise `Model API error`) and terminate via `classify_step` as
+`blocked`; checkpointed `thread_id`s reset per-turn channels so turn 2
+doesn't inherit turn 1's `stop_reason`; `TurnEventQueue` implements
+`AgentTurnCallbacks` adapters so the graph sink can publish `TurnEvent`s
+and the verify gate aggregates `tool_result_ok` (`ok` via `all`); the thin
+`runtime={"turnKernel":"thin"}` escape hatch is removed (flag now ignored).
+
 ## Compatibility and testing
 
-The graph is exposed through `minicode.graph.build_agent_graph` and does not
-replace an existing CLI entrypoint. Tests use a real compiled graph and a small
-tool executor callback, with no provider credentials or network calls.
+The graph is exposed through `minicode.graph.build_agent_graph` (slice-1
+demo) and `minicode.graph.build_model_graph` / `minicode.graph.run_graph_turn`
+and does not replace an existing CLI entrypoint. Tests use a real compiled
+graph and a small tool executor callback, with no provider credentials or
+network calls.
 
-`build_model_graph(turn_kernel=False)` (selected by
-`runtime={"turnKernel": "thin"}`) keeps the slice-1 thin topology as a
-construction-time escape hatch; the flag is scheduled for removal in slice 3.
-Kernel strength follows `RuntimeProfile` fields: the `single` profile keeps
-widening and the strict evidence guard dormant, `single-deep` enables them.
-Caller-visible changes: transcripts gain phase progress lines and nudge
-messages; headless empty-response scenarios return a typed fallback message
-instead of spinning; `tools/task.py` reports real `assistant_tool_call` counts.
+`build_model_graph` no longer accepts `turn_kernel` — `runtime={"turnKernel":
+"thin"}` is accepted but ignored since slice 3. Kernel strength follows
+`RuntimeProfile` fields: the `single` profile keeps widening and the strict
+evidence guard dormant, `single-deep` enables them. Caller-visible changes:
+transcripts gain phase progress lines and nudge messages; headless
+empty-response scenarios return a typed fallback message instead of spinning;
+`tools/task.py` reports real `assistant_tool_call` counts; headless provider
+failures surface as `Provider availability failure: …fallback…` through the
+graph fallback rather than an exception.

@@ -934,6 +934,11 @@ def snapshot_to_turn_state(snapshot: Mapping[str, Any]) -> TurnRecurrentState:
         latest_tool_result_summary=str(
             snapshot.get("latest_tool_result_summary", "") or ""
         ),
+        progress_state=(
+            {"summary": str(snapshot.get("progress_summary", "") or "")[:280]}
+            if str(snapshot.get("progress_summary", "") or "")
+            else {}
+        ),
         stop_reason=snapshot.get("stop_reason"),
         verification_state=TurnVerificationState(
             strict=bool(snapshot.get("verification_strict", False)),
@@ -995,6 +1000,7 @@ def turn_state_to_snapshot(turn_state: TurnRecurrentState) -> dict[str, Any]:
         "widening_trigger_reason": turn_state.widening_trigger_reason,
         "widening_trigger_evidence": turn_state.widening_trigger_evidence,
         "latest_tool_result_summary": turn_state.latest_tool_result_summary,
+        "progress_summary": str(turn_state.progress_state.get("summary", "") or ""),
         "stop_reason": turn_state.stop_reason,
         "verification_strict": verification.strict,
         "verification_requires_explicit_final": verification.requires_explicit_final,

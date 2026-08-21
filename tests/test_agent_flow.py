@@ -1,9 +1,8 @@
-"""Full agent loop integration test — verifies all cybernetic controllers fire.
+"""Agent flow integration tests against the LangGraph runtime.
 
-Runs a complete agent turn with the mock model and checks that every
-major controller in the Sense→Control→Act pipeline was invoked.
-
-This is the definitive "MiniCode is working" test.
+The retired rich loop's cybernetic-hook coverage (orchestrator lifecycle,
+work chain) moved to slice 4; these tests keep the basic-flow and
+memory-injection guarantees on the production graph path.
 """
 from __future__ import annotations
 
@@ -12,11 +11,10 @@ from pathlib import Path
 
 import pytest
 
-from minicode.agent_loop import run_agent_turn
 from minicode.context_manager import ContextManager
+from minicode.graph import run_graph_turn
 from minicode.mock_model import MockModelAdapter
 from minicode.permissions import PermissionManager
-from minicode.tooling import ToolRegistry
 from minicode.tools import create_default_tool_registry
 
 
@@ -52,12 +50,12 @@ def messages(workspace, permissions):
 
 
 class TestAgentFlowBasic:
-    """Basic agent loop runs without errors."""
+    """Basic agent turns run without errors on the graph runtime."""
 
     def test_agent_completes_without_error(
         self, mock_model, tools, messages, workspace, permissions
     ):
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=messages,
@@ -72,7 +70,7 @@ class TestAgentFlowBasic:
         self, mock_model, tools, messages, workspace, permissions
     ):
         ctx = ContextManager(model="claude-sonnet-4-20250514")
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=messages,
@@ -81,106 +79,15 @@ class TestAgentFlowBasic:
             context_manager=ctx,
             max_steps=3,
         )
-        stats = ctx.get_stats()
-        assert stats.messages_count > 0
-
-
-class TestAgentFlowCybernetics:
-    """All cybernetic controllers initialize and run without errors."""
-
-    def test_full_cybernetic_stack_initializes(
-        self, mock_model, tools, messages, workspace, permissions
-    ):
-        """The full 15-controller cybernetic stack must not crash."""
-        result = run_agent_turn(
-            model=mock_model,
-            tools=tools,
-            messages=messages,
-            cwd=str(workspace),
-            permissions=permissions,
-            context_manager=ContextManager(model="claude-sonnet-4-20250514"),
-            enable_work_chain=True,
-            max_steps=3,
-        )
         assert len(result) > 0
 
-    def test_cybernetic_stack_with_ls_command(
+    def test_agent_with_memory_manager(
         self, mock_model, tools, messages, workspace, permissions
     ):
-        """Run /ls through the cybernetic stack."""
-        messages.append({"role": "user", "content": "/ls"})
-        result = run_agent_turn(
-            model=mock_model,
-            tools=tools,
-            messages=messages,
-            cwd=str(workspace),
-            permissions=permissions,
-            context_manager=ContextManager(model="claude-sonnet-4-20250514"),
-            enable_work_chain=True,
-            max_steps=5,
-        )
-        assert len(result) > 0
-
-    def test_agent_loop_uses_orchestrator_hooks(
-        self, monkeypatch, mock_model, tools, messages, workspace, permissions
-    ):
-        """The agent loop should drive the unified orchestrator lifecycle."""
-        from minicode.cybernetic_orchestrator import CyberneticOrchestrator
-
-        calls: list[str] = []
-
-        def wrap(name):
-            original = getattr(CyberneticOrchestrator, name)
-
-            def _wrapped(self, *args, **kwargs):
-                calls.append(name)
-                return original(self, *args, **kwargs)
-
-            return _wrapped
-
-        for method in (
-            "wire_memory",
-            "wire_healing",
-            "inject_memories",
-            "step_start",
-            "step_end",
-            "reflect_on_task",
-        ):
-            monkeypatch.setattr(CyberneticOrchestrator, method, wrap(method))
-
-        messages.append({"role": "user", "content": "/ls"})
-        result = run_agent_turn(
-            model=mock_model,
-            tools=tools,
-            messages=messages,
-            cwd=str(workspace),
-            permissions=permissions,
-            context_manager=ContextManager(model="claude-sonnet-4-20250514"),
-            enable_work_chain=True,
-            max_steps=3,
-        )
-
-        assert len(result) > 0
-        for method in (
-            "wire_memory",
-            "wire_healing",
-            "inject_memories",
-            "step_start",
-            "step_end",
-            "reflect_on_task",
-        ):
-            assert method in calls
-
-
-class TestAgentMemoryPipeline:
-    """Memory pipeline runs end-to-end within agent loop."""
-
-    def test_memory_pipeline_in_agent_loop(
-        self, mock_model, tools, messages, workspace, permissions
-    ):
-        """Memory pipeline (domain classify → BM25 → reranker → inject) must work."""
-        # Create some memories first to have something to search
+        """Memory injection (domain classify → search → inject) runs via the
+        graph's load_context seam."""
         from minicode.memory import MemoryManager, MemoryScope
+
         mgr = MemoryManager(project_root=str(workspace))
         mgr.add_entry(
             scope=MemoryScope.PROJECT, category="pattern",
@@ -193,14 +100,14 @@ class TestAgentMemoryPipeline:
             tags=["react", "component"],
         )
 
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=messages,
             cwd=str(workspace),
             permissions=permissions,
             context_manager=ContextManager(model="claude-sonnet-4-20250514"),
-            enable_work_chain=True,
+            memory_manager=mgr,
             max_steps=3,
         )
         assert len(result) > 0

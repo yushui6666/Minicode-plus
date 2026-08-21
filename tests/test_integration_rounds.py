@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from minicode.agent_loop import run_agent_turn
+from minicode.graph import run_graph_turn
 from minicode.context_compactor import ToolResultBudgetManager
 from minicode.context_manager import ContextManager, compute_context_stats
 from minicode.headless import _make_auto_approve_prompt
@@ -72,7 +72,7 @@ def test_round1_multi_turn_edits_and_session_resume(tmp_path):
         AgentStep(type="tool_calls", calls=[{"id": "1", "toolName": "write_file", "input": {"path": str(target), "content": "v1\n"}}]),
         AgentStep(type="assistant", content="wrote v1"),
     ])
-    run_agent_turn(model=m1, tools=tools, messages=[{"role": "system", "content": "s"}], cwd=str(tmp_path), permissions=perm, runtime={"model": "mock"})
+    run_graph_turn(model=m1, tools=tools, messages=[{"role": "system", "content": "s"}], cwd=str(tmp_path), permissions=perm, runtime={"model": "mock"})
     assert target.read_text(encoding="utf-8") == "v1\n"
 
     # Turn 2: read it back
@@ -80,7 +80,7 @@ def test_round1_multi_turn_edits_and_session_resume(tmp_path):
         AgentStep(type="tool_calls", calls=[{"id": "2", "toolName": "read_file", "input": {"path": str(target)}}]),
         AgentStep(type="assistant", content="read it"),
     ])
-    res = run_agent_turn(model=m2, tools=tools, messages=[{"role": "system", "content": "s"}], cwd=str(tmp_path), permissions=perm, runtime={"model": "mock"})
+    res = run_graph_turn(model=m2, tools=tools, messages=[{"role": "system", "content": "s"}], cwd=str(tmp_path), permissions=perm, runtime={"model": "mock"})
     assert any("v1" in (m.get("content") or "") for m in res if m.get("role") == "tool_result")
 
     # Session round-trip (session update_metadata must not crash on any content)

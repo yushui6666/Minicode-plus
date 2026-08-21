@@ -172,9 +172,13 @@ class AgentTurnEventSink(Protocol):
 class TurnEventQueue:
     """Thread-safe unbounded turn-event channel, mirroring Rust's TUI mpsc.
 
-    The agent thread only calls :meth:`on_event`; the TUI thread calls
-    :meth:`drain`.  Stream and thinking channels are opt-in because enabling
-    either one changes how some provider adapters format their request.
+    The agent thread can call :meth:`on_event` directly OR the
+    :class:`AgentTurnCallbacks` adapter methods below — the graph runtime
+    dispatches through ``getattr(callbacks, "on_tool_start"/...)`` and these
+    adapters publish the matching typed events so mid-turn activity reaches
+    the TUI. The TUI thread calls :meth:`drain`. Stream and thinking channels
+    are opt-in because enabling either one changes how some provider
+    adapters format their request.
     """
 
     def __init__(
@@ -193,6 +197,29 @@ class TurnEventQueue:
 
         with self._lock:
             self._events.append(event)
+
+    # ── AgentTurnCallbacks adapters ────────────────────────────────────────
+
+    def on_tool_start(self, tool_name: str, tool_input: Any) -> None:
+        self.on_event(
+            TurnEvent.tool_started(step=None, tool_name=tool_name, tool_input=tool_input)
+        )
+
+    def on_tool_result(self, tool_name: str, output: str, is_error: bool) -> None:
+        self.on_event(
+            TurnEvent.tool_finished(
+                step=None, tool_name=tool_name, output=output, is_error=is_error
+            )
+        )
+
+    def on_assistant_message(self, content: str) -> None:
+        self.on_event(TurnEvent.assistant_message(step=None, content=content))
+
+    def on_progress_message(self, content: str) -> None:
+        self.on_event(TurnEvent.progress_message(step=None, content=content))
+
+    def on_runtime_event(self, event: RuntimeEvent) -> None:
+        self.on_event(TurnEvent.runtime_message(step=event.step, event=event))
 
     def drain(
         self,

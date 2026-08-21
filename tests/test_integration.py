@@ -23,7 +23,7 @@ import pytest
 # Ensure py-src is on path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from minicode.agent_loop import run_agent_turn
+from minicode.graph import run_graph_turn
 from minicode.mock_model import MockModelAdapter
 from minicode.permissions import PermissionManager
 from minicode.tooling import ToolContext, ToolRegistry, ToolDefinition, ToolResult
@@ -127,7 +127,7 @@ class TestAgentLoopIntegration:
         def on_assistant_message(msg):
             callback_log.append({"event": "assistant", "message": msg})
 
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=system_messages,
@@ -165,7 +165,7 @@ class TestAgentLoopIntegration:
         """Agent receives /read → calls read_file tool → returns file content."""
         system_messages.append({"role": "user", "content": "/read hello.txt"})
 
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=system_messages,
@@ -188,7 +188,7 @@ class TestAgentLoopIntegration:
             "content": "/write output.txt::Test content from integration test",
         })
 
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=system_messages,
@@ -211,7 +211,7 @@ class TestAgentLoopIntegration:
             "content": "/edit hello.txt::Hello, world!::Hello, MiniCode!",
         })
 
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=system_messages,
@@ -232,7 +232,7 @@ class TestAgentLoopIntegration:
             "content": f"/grep greet::{tmp_workspace / 'src'}",
         })
 
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=system_messages,
@@ -253,7 +253,7 @@ class TestAgentLoopIntegration:
         cmd = "echo integration_test_ok"
         system_messages.append({"role": "user", "content": f"/cmd {cmd}"})
 
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=system_messages,
@@ -273,7 +273,7 @@ class TestAgentLoopIntegration:
         """Agent receives /tools → returns tool list (no tool call needed)."""
         system_messages.append({"role": "user", "content": "/tools"})
 
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=system_messages,
@@ -304,7 +304,7 @@ class TestAgentLoopIntegration:
                 )
 
         system_messages.append({"role": "user", "content": "infinite loop"})
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=InfiniteToolCallModel(),
             tools=tools,
             messages=system_messages,
@@ -327,7 +327,7 @@ class TestAgentLoopIntegration:
                 raise ConnectionError("Simulated network failure")
 
         system_messages.append({"role": "user", "content": "test error"})
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=ErrorModel(),
             tools=tools,
             messages=system_messages,
@@ -349,7 +349,7 @@ class TestAgentLoopIntegration:
                 raise TimeoutError("Request timed out after 60s")
 
         system_messages.append({"role": "user", "content": "test timeout"})
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=TimeoutModel(),
             tools=tools,
             messages=system_messages,
@@ -380,7 +380,7 @@ class TestContextManagerIntegration:
 
         system_messages.append({"role": "user", "content": "/ls"})
 
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=system_messages,
@@ -418,7 +418,7 @@ class TestPermissionIntegration:
         permissions = PermissionManager(str(tmp_workspace), prompt=_deny_all)
         system_messages.append({"role": "user", "content": "/cmd echo should_not_run"})
 
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=system_messages,
@@ -451,7 +451,7 @@ class TestPermissionIntegration:
 
         # First command
         system_messages.append({"role": "user", "content": "/cmd echo first"})
-        run_agent_turn(
+        run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=system_messages,
@@ -575,7 +575,7 @@ class TestMultiStepInteraction:
         msgs_t1 = list(system_messages)
         msgs_t1.append({"role": "user", "content": "/read src/main.py"})
 
-        msgs_t1 = run_agent_turn(
+        msgs_t1 = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=msgs_t1,
@@ -594,7 +594,7 @@ class TestMultiStepInteraction:
             "content": "/write src/new_module.py::# Auto-generated\ndef hello():\n    return 'world'",
         })
 
-        msgs_t2 = run_agent_turn(
+        msgs_t2 = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=msgs_t2,
@@ -617,7 +617,7 @@ class TestMultiStepInteraction:
             "content": f"/grep get_cwd::{tmp_workspace / 'src'}",
         })
 
-        msgs_t1 = run_agent_turn(
+        msgs_t1 = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=msgs_t1,
@@ -637,7 +637,7 @@ class TestMultiStepInteraction:
             "content": "/edit src/utils.py::def get_cwd() -> str:::def get_current_dir() -> str:",
         })
 
-        msgs_t2 = run_agent_turn(
+        msgs_t2 = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=msgs_t2,
@@ -667,7 +667,7 @@ class TestPatchFileIntegration:
             "content": "/patch src/main.py::greet::welcome::Hello::Hi",
         })
 
-        messages = run_agent_turn(
+        messages = run_graph_turn(
             model=mock_model,
             tools=tools,
             messages=messages,
@@ -735,7 +735,7 @@ class TestLiveAPI:
             {"role": "user", "content": "What is 2 + 2? Answer with just the number."},
         ]
 
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=model,
             tools=tools,
             messages=messages,
@@ -772,7 +772,7 @@ class TestLiveAPI:
             },
         ]
 
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=model,
             tools=tools,
             messages=messages,
@@ -858,7 +858,7 @@ class TestFullPipelineSmokeTest:
             messages = list(base_system)
             messages.append({"role": "user", "content": user_input})
             permissions.begin_turn()
-            result = run_agent_turn(
+            result = run_graph_turn(
                 model=model,
                 tools=tools,
                 messages=messages,

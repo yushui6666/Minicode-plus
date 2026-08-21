@@ -24,7 +24,7 @@ from minicode.memory import (
     inject_memory_into_prompt,
     _tokenize,
 )
-from minicode.agent_loop import run_agent_turn
+from minicode.graph import run_graph_turn
 from minicode.mock_model import MockModelAdapter
 from minicode.permissions import PermissionManager
 from minicode.tools import create_default_tool_registry
@@ -134,7 +134,7 @@ class TestFullAgentLoopMemoryRetrieval:
             {"role": "system", "content": injected_prompt},
             {"role": "user", "content": "/tools"},
         ]
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=MockModelAdapter(),
             tools=tools,
             messages=msgs,
@@ -164,7 +164,7 @@ class TestFullAgentLoopMemoryRetrieval:
             )},
             {"role": "user", "content": "/ls"},
         ]
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=MockModelAdapter(),
             tools=tools,
             messages=msgs,
@@ -200,7 +200,7 @@ class TestFullAgentLoopMemoryRetrieval:
             )},
             {"role": "user", "content": "/read hello.txt"},
         ]
-        run_agent_turn(
+        run_graph_turn(
             model=MockModelAdapter(),
             tools=tools,
             messages=msgs,
@@ -258,7 +258,7 @@ class TestMultiTurnMemoryAccumulation:
                 {"role": "system", "content": injected},
                 {"role": "user", "content": user_input},
             ]
-            result = run_agent_turn(
+            result = run_graph_turn(
                 model=MockModelAdapter(),
                 tools=tools,
                 messages=msgs,
@@ -335,7 +335,7 @@ class TestMultiTurnMemoryAccumulation:
                 {"role": "system", "content": injected},
                 {"role": "user", "content": "/ls"},
             ]
-            run_agent_turn(
+            run_graph_turn(
                 model=MockModelAdapter(),
                 tools=tools,
                 messages=msgs,
@@ -559,7 +559,7 @@ class TestMemoryDrivenContextAdaptation:
             {"role": "system", "content": injected_prompt},
             {"role": "user", "content": "/tools"},
         ]
-        run_agent_turn(
+        run_graph_turn(
             model=model,
             tools=tools,
             messages=msgs,
@@ -762,7 +762,7 @@ class TestChineseLanguageMemoryE2E:
             {"role": "system", "content": injected},
             {"role": "user", "content": "/ls"},
         ]
-        result = run_agent_turn(
+        result = run_graph_turn(
             model=MockModelAdapter(),
             tools=tools,
             messages=msgs,

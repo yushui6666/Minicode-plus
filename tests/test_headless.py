@@ -169,6 +169,9 @@ def test_headless_main_returns_zero_for_success(monkeypatch, capsys) -> None:
 def test_headless_main_help_does_not_load_config(monkeypatch, capsys) -> None:
     import minicode.headless
 
+    # Python 3.14 colorizes argparse help when FORCE_COLOR is set (e.g. inside
+    # CI wrappers); pin plain output so the plain-text assertion holds.
+    monkeypatch.setenv("NO_COLOR", "1")
     monkeypatch.setattr(
         minicode.headless,
         "run_headless",
