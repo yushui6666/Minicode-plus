@@ -120,3 +120,14 @@ environment noise, documented here for the next runner).
 - [x] Tests: `test_graph_checkpoint_resumes_across_threads`, `test_authorize_denies_batch`, plus shim equivalence test.
 - [x] Verify: `tests/test_langgraph_runtime.py` + `tests/test_graph_multi_tool.py` + `tests/test_graph_checkpoint.py` = 38 passed; focused regression 329 passed (1 sandbox network noise excluded).
 
+### Task 7: Graph parity — store/provider fallback, callbacks, and default flip (slice 5, pending)
+
+**Files:** `minicode/graph/runtime.py`, `minicode/graph/builder.py`, `minicode/agent_loop.py`, `tests/test_agent_loop.py`
+
+- [ ] Parity gap (2026-08-21, MINICODE_USE_GRAPH=1): 9/27 `test_agent_loop.py` fail when shim delegates to graph — callbacks (`test_emits_callbacks` progress "working" vs phase line), recoverable `pause_turn` (`test_handles_recoverable_pause_turn`), store passthrough (`test_passes_store_to_provider_adapter`), verify guard (`test_single_deep_verify_phase_blocks...`), fallback-chain 5 tests (`test_switches_to_fallback_model...`, `test_does_not_bounce...`, `test_infers_active_runtime_model...`, `test_uses_default_runtime_fallback_chain...`, `test_provider_outage_guidance...`). Root causes: `run_graph_turn.next_step` does not forward `store`/`on_thinking_delta` via signature inspection (cf. `agent_loop._model_next`), graph error fallback does not implement `ModelSwitcher`/provider-channel retry, `GraphEventSink`/ `assistant_followup` progress wiring diverges from legacy `on_progress_message`, and `StepDiagnostics(stopReason=pause_turn)` recoverable path not mirrored.
+- [ ] Wire `store` + streaming kwargs into `next_step` (inspect `model.next` signature, forward `store`/`on_thinking_delta`/`on_stream_chunk`), and surface provider-switch logic (at least: typed error → fallback chain attempt before emitting `kind="error"` blocked stop; mirror `agent_loop._model_next` + fallback guidance).
+- [ ] Align callbacks: `assistant_followup`/`step_policy` progress events vs legacy `contentKind="progress"` nudges; ensure `on_tool_start`/`on_tool_result`/`on_assistant_message`/`on_progress_message`/`on_runtime_event` parity via `TurnEventQueue` adapters (already wired) — fix the 4 single-case failures above before flipping default.
+- [ ] Flip shim default: `MINICODE_USE_GRAPH` default True (or remove opt-in gate), keep `runtime={"useGraph": False}` / env `MINICODE_USE_GRAPH=0` as rollback escape hatch; delete legacy loop only after `MINICODE_USE_GRAPH=1` full suite 1421+ passed (sandbox network noise excluded).
+- [ ] Verify: `MINICODE_USE_GRAPH=1 .venv/bin/python -m pytest tests/test_agent_loop.py -q` 27 passed; `tests/test_langgraph_runtime.py` + `tests/test_graph_multi_tool.py` + `tests/test_graph_checkpoint.py` 36+? still green; full suite 1421 passed (1 known `test_provider_smoke_reaches_local_openai...` PermissionError noise).
+
+
