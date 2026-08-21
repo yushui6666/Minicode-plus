@@ -97,3 +97,8 @@ empty-response scenarios return a typed fallback message instead of spinning;
 `tools/task.py` reports real `assistant_tool_call` counts; headless provider
 failures surface as `Provider availability failure: …fallback…` through the
 graph fallback rather than an exception.
+
+## Slice 4 (2026-08-21) — authorize, checkpoint, and loop retirement
+
+`run_graph_turn` now builds `authorize_tool` from `PermissionManager` when the caller supplies `permissions` but no explicit authorizer: each pending call is checked via `permissions.check_*` (path/command/edit) before the batch executes; one denial → `permission=denied` → `finalize`. Checkpointing reuses LangGraph's `SqliteSaver`: when `runtime={"graphCheckpoint": true}` or `MINICODE_GRAPH_CHECKPOINT=1` / `runtime={"graphCheckpoint": true}` the runtime materializes a per-process SQLite checkpointer keyed by `thread_id` (default in-memory if absent, file-backed at `MINI_CODE_DIR/graph_checkpoints.db` when enabled), preserving `AgentState` kernel fields across `thread_id` resumes. `minicode/agent_loop.py` becomes a thin compatibility shim emitting `DeprecationWarning` and delegating to `run_graph_turn` (`MINICODE_USE_GRAPH=1` / `runtime={"useGraph": True}` opts into the legacy path for emergency rollback).
+

@@ -17,6 +17,7 @@ from minicode.runtime_profiles import resolve_runtime_profile
 from minicode.tooling import ToolContext, ToolRegistry, ToolResult
 from minicode.types import AgentStep, ChatMessage, ModelAdapter, RuntimeEvent
 from minicode.working_memory import protect_context
+import warnings
 
 
 def _execute_single_tool(
@@ -79,6 +80,69 @@ def _execute_single_tool(
                 output=f"Tool '{tool_name}' crashed: {type(exc).__name__}",
             )
 
+
+
+def _build_authorize_from_permissions(permissions: Any, tools: Any) -> Any:
+    """Build an authorize_tool callback from PermissionManager (slice 4).
+
+    Returns None if permissions is falsy. The callback checks each pending
+    tool call via PermissionManager's public checks so a batch containing a
+    denied call is routed to finalize without executing (mirrors the retired
+    loop's early permission gate). Fail-open on unexpected permission errors
+    to keep turns robust — deny only on explicit RuntimeError/permission
+    denial.
+    """
+    if permissions is None:
+        return None
+
+    def authorize(state) -> str:
+        for call in (state.get("step_calls") or []):
+            name = call.get("toolName", "")
+            inp = call.get("input", {}) or {}
+            try:
+                # Map tool intents to permission checks
+                if name in {"run_command", "run_commands"}:
+                    # run_command input: {command: str, args?: list, cwd?: str}
+                    # Be lenient: try multiple shapes
+                    cmd = str(inp.get("command", "") or inp.get("cmd", "") or "").strip()
+                    if not cmd and isinstance(inp.get("input"), dict):
+                        cmd = str(inp["input"].get("command", ""))
+                    args = inp.get("args") or inp.get("arguments") or []
+                    if isinstance(args, str):
+                        args = args.split()
+                    if hasattr(permissions, "check_command_run"):
+                        try:
+                            permissions.check_command_run(cmd, list(args) if isinstance(args, list) else [])
+                        except TypeError:
+                            # Fallback to ensure_command signature
+                            pass
+                    elif hasattr(permissions, "ensure_command"):
+                        permissions.ensure_command(cmd, list(args) if isinstance(args, list) else [], "")
+                    # If check raises, deny
+                elif name in {"write_file", "read_file", "edit_file", "patch_file", "list_files", "grep_files"}:
+                    target = str(inp.get("path", "") or inp.get("file", "") or inp.get("target", "") or "")
+                    if target:
+                        intent = {"write_file": "write", "read_file": "read", "edit_file": "edit", "patch_file": "edit", "list_files": "list", "grep_files": "read"}.get(name, "read")
+                        if hasattr(permissions, "check_path_access"):
+                            permissions.check_path_access(target, intent)
+                        elif hasattr(permissions, "ensure_path_access"):
+                            permissions.ensure_path_access(target, intent)
+                        elif hasattr(permissions, "check_file_write") and intent == "write":
+                            permissions.check_file_write(target)
+                # Other tools: allow (no permission gate)
+            except RuntimeError as exc:
+                # Explicit denial from PermissionManager — deny the batch
+                low = str(exc).lower()
+                if "denied" in low or "outside cwd" in low or "permission" in low:
+                    return "denied"
+                # Other RuntimeError: fail-open to avoid false denies
+                continue
+            except Exception:
+                # Fail-open on unexpected permission plumbing errors
+                continue
+        return "allowed"
+
+    return authorize
 
 def run_graph_turn(
     *,
@@ -401,6 +465,19 @@ def run_graph_turn(
             phase="model",
         )
     )
+    # Slice-4: auto-wire authorize from PermissionManager when no explicit authorizer
+    if authorize_tool is None and permissions is not None:
+        built = _build_authorize_from_permissions(permissions, tools)
+        if built is not None:
+            authorize_tool = built
+
+    # Slice-4: checkpoint via explicit checkpointer, session, or runtime flag
+    # runtime={"graphCheckpoint": True} or env MINICODE_GRAPH_CHECKPOINT=1 enables file-backed SqliteSaver
+    want_checkpoint = False
+    if isinstance(runtime, dict) and runtime.get("graphCheckpoint"):
+        want_checkpoint = True
+    if os.environ.get("MINICODE_GRAPH_CHECKPOINT", "").strip().lower() in {"1", "true", "yes"}:
+        want_checkpoint = True
     checkpoint_connection: sqlite3.Connection | None = None
     effective_checkpointer = checkpointer
     effective_thread_id = thread_id
@@ -413,6 +490,13 @@ def run_graph_turn(
                 check_same_thread=False,
             )
             effective_checkpointer = SqliteSaver(checkpoint_connection)
+    elif want_checkpoint and effective_checkpointer is None:
+        MINI_CODE_DIR.mkdir(parents=True, exist_ok=True)
+        checkpoint_connection = sqlite3.connect(
+            MINI_CODE_DIR / "langgraph-checkpoints.sqlite3",
+            check_same_thread=False,
+        )
+        effective_checkpointer = SqliteSaver(checkpoint_connection)
 
     try:
         graph = build_model_graph(

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import inspect
+import os
 import re
+import warnings
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -760,6 +762,50 @@ def run_agent_turn(
     enable_work_chain: bool = True,
     callbacks: AgentTurnCallbacks | AgentTurnEventSink | None = None,
 ) -> list[ChatMessage]:
+    # Slice-4 shim: LangGraph delegate is opt-in (MINICODE_USE_GRAPH=1 or runtime={"useGraph": True})
+    # to keep legacy tests green while exposing the new path for migration callers.
+    import warnings as _warnings
+    _warnings.warn(
+        "minicode.agent_loop.run_agent_turn is deprecated; use minicode.graph.run_graph_turn",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    want_graph = False
+    if os.environ.get("MINICODE_USE_GRAPH", "").strip().lower() in {"1", "true", "yes"}:
+        want_graph = True
+    if isinstance(runtime, dict) and runtime.get("useGraph"):
+        want_graph = True
+    if want_graph:
+        try:
+            from minicode.graph import run_graph_turn as _graph_run
+
+            # Map common params; drop legacy-only surfaces (metrics, hooks, pipeline, work_chain) as no-ops
+            return _graph_run(
+                model=model,
+                tools=tools,
+                messages=messages,
+                cwd=cwd,
+                permissions=permissions,
+                session=session,
+                max_steps=max_steps,
+                thread_id=str(getattr(session, "session_id", "default") if session is not None else "default"),
+                authorize_tool=None,
+                load_context=None,
+                compact_context=None,
+                repair=None,
+                callbacks=callbacks,
+                context_manager=context_manager,
+                memory_manager=memory_manager,
+                runtime=runtime,
+                store=store,
+                on_tool_start=on_tool_start,
+                on_tool_result=on_tool_result,
+                on_assistant_message=on_assistant_message,
+                on_progress_message=on_progress_message,
+                on_runtime_event=on_runtime_event,
+            )
+        except Exception as _graph_exc:  # noqa: BLE001 - fall back to legacy loop if graph path fails
+            _warnings.warn(f"graph shim failed, falling back to legacy loop: {_graph_exc}", RuntimeWarning, stacklevel=2)
     # Prelude: prepare per-turn state before we enter the recurrent think/act loop.
     current_messages = list(messages)
     runtime = runtime or {}

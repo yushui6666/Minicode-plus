@@ -109,3 +109,14 @@ environment noise, documented here for the next runner).
   `tests/test_headless.py::test_run_headless_provider_failure_uses_runtime_channel_details`
   was failing against the new fallback path (fixed by provider-channel
   detection in `runtime.py:178`); full suite 1424 passed, 2 skipped.
+
+### Task 6: Authorize wiring, checkpoint resume, and agent_loop shim (slice 4)
+
+**Files:** `minicode/graph/runtime.py`, `minicode/graph/builder.py`, `minicode/agent_loop.py`, `minicode/turn_events.py`, `tests/test_graph_checkpoint.py`, `tests/test_langgraph_runtime.py`
+
+- [x] Wire `PermissionManager` into the graph `authorize` node: `run_graph_turn` builds `authorize_tool` from `permissions`+`tools` when none is supplied (deny-list via `permissions._check` + tool concurrency-safety still via `ToolScheduler`), batch deny → `permission=denied` → `finalize` without executing.
+- [x] Checkpoint resume: `run_graph_turn` auto-creates a `SqliteSaver` when `store`/`checkpointer` is supplied via `runtime={"graphCheckpoint": true}` or `MINICODE_GRAPH_CHECKPOINT=1`, threads are isolated by `thread_id`, `checkpoint_ns` stays default, and `graph.get_state` round-trips the kernel fields.
+- [x] Retire `agent_loop.run_agent_turn` as a shim: emit `DeprecationWarning`, delegate to `run_graph_turn` when `MINICODE_USE_GRAPH=1` or `runtime={"useGraph": True}` (preserve `store`/`metrics_collector`/`hooks` no-op passthrough for compat), else fallback to legacy loop; keep `build_model_graph` as the single topology.
+- [x] Tests: `test_graph_checkpoint_resumes_across_threads`, `test_authorize_denies_batch`, plus shim equivalence test.
+- [x] Verify: `tests/test_langgraph_runtime.py` + `tests/test_graph_multi_tool.py` + `tests/test_graph_checkpoint.py` = 38 passed; focused regression 329 passed (1 sandbox network noise excluded).
+
