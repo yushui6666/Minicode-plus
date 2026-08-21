@@ -132,4 +132,11 @@ environment noise, documented here for the next runner).
 
 Slice 5 parity complete — graph is now the default orchestration boundary; legacy loop retained only as rollback escape hatch until deletion.
 
+### Task 8: Delete hand-written loop (slice 5 cleanup)
+
+**Files:** `minicode/agent_loop.py`
+
+- [x] Remove the ~1900-line hand-written `while turn_state.has_remaining_steps()` loop; `run_agent_turn` is now a thin deprecation shim that always delegates to `minicode.graph.run_graph_turn` (helpers `_summarize_model_api_failure`/`_infer_active_model_id`/`_should_attempt_model_fallback` kept for `graph/runtime` imports). `MINICODE_USE_GRAPH=0` / `runtime:{useGraph:false}` now only warns (`UserWarning`) and still delegates to the graph.
+- [x] Verify: `tests/test_agent_loop.py` 24 passed (default) / 24 passed (`MINICODE_USE_GRAPH=0` with UserWarning); `test_turn_events+langgraph+multi_tool+checkpoint` 42 passed; `minicode/agent_loop.py` 2643→818 lines.
+
 
