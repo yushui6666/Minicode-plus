@@ -99,13 +99,22 @@ def load_skill(cwd: str | Path, name: str) -> LoadedSkill | None:
         skill_path = root / normalized_name / "SKILL.md"
         if skill_path.exists():
             content = skill_path.read_text(encoding="utf-8")
-            return LoadedSkill(
+            desc = extract_description(content)
+            skill = LoadedSkill(
                 name=normalized_name,
-                description=extract_description(content),
+                description=desc,
                 path=str(skill_path),
                 source=source,
                 content=content,
             )
+            # record usage for hotlist (fail-open, lazy import to avoid cycle)
+            try:
+                from minicode.skill_hotlist import record_skill_use  # type: ignore
+
+                record_skill_use(cwd, normalized_name, description=desc)
+            except Exception:
+                pass
+            return skill
     return None
 
 
@@ -142,4 +151,3 @@ def remove_managed_skill(cwd: str | Path, name: str, scope: str = "user") -> dic
         return {"removed": False, "targetPath": str(target_path)}
     shutil.rmtree(target_path)
     return {"removed": True, "targetPath": str(target_path)}
-

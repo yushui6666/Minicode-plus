@@ -22,6 +22,17 @@ import os
 import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
+from minicode.skill_hotlist import get_hot_skills_for_prompt
+
+
+def _get_prompt_skills_headless(cwd: str, tools, query: str | None = None) -> list[dict]:
+    try:
+        return get_hot_skills_for_prompt(cwd, query=query)
+    except Exception:
+        try:
+            return tools.get_skills() if tools else []
+        except Exception:
+            return []
 
 
 def _headless_response_exit_code(response: str) -> int:
@@ -232,7 +243,7 @@ def run_headless(prompt: str | None = None, allow_edits: bool = False) -> str:
                 cwd,
                 permissions.get_summary(),
                 {
-                    "skills": tools.get_skills(),
+                    "skills": _get_prompt_skills_headless(cwd, tools, query=prompt),
                     "mcpServers": tools.get_mcp_servers(),
                     "memory_context": memory_mgr.get_relevant_context(),
                 },

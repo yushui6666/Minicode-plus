@@ -65,22 +65,10 @@ def _execute_single_tool(
                     output=f"Tool '{tool_name}' timed out after {tool_timeout}s",
                 )
     except Exception as exc:  # noqa: BLE001 - a tool crash must not kill the turn
-        try:
-            return tools.execute(
-                tool_name,
-                tool_input,
-                ToolContext(
-                    cwd=cwd,
-                    permissions=permissions,
-                    session=session,
-                    _runtime=runtime,
-                ),
-            )
-        except Exception:  # noqa: BLE001
-            return ToolResult(
-                ok=False,
-                output=f"Tool '{tool_name}' crashed: {type(exc).__name__}",
-            )
+        return ToolResult(
+            ok=False,
+            output=f"Tool '{tool_name}' crashed: {type(exc).__name__}: {exc}",
+        )
 
 
 
@@ -242,10 +230,22 @@ def run_graph_turn(
     # inside the adapter). Model API failures degrade gracefully — the
     # retired loop caught provider exceptions and returned a typed
     # fallback message instead of crashing the turn.
-    def _call_model(messages: list[dict[str, Any]]) -> AgentStep:
-        # Mirror agent_loop._model_next signature inspection: forward store and streaming kwargs
-        kwargs: dict[str, Any] = {}
-        # Determine streaming intent from callbacks object
+
+    from minicode.model_fallback import call_model_with_fallback
+
+    def _publish_stream(chunk: str) -> None:
+        try:
+            _publish(TurnEvent.assistant_stream_chunk(step=None, content=chunk))
+        except Exception:
+            pass
+
+    def _publish_thinking(chunk: str) -> None:
+        try:
+            _publish(TurnEvent.thinking_chunk(step=None, content=chunk))
+        except Exception:
+            pass
+
+    def next_step(state: AgentState) -> AgentStep:
         want_stream = False
         want_thinking = False
         if callbacks is not None:
@@ -256,216 +256,23 @@ def run_graph_turn(
                     want_thinking = True
             except Exception:
                 pass
-        # Also consider legacy explicit stream callbacks if they were passed via runtime (not in this shim)
-        # For now, only structured queue flags control it
 
-        def _on_stream_chunk(chunk: str) -> None:
-            try:
-                _publish(TurnEvent.assistant_stream_chunk(step=None, content=chunk))
-            except Exception:
-                pass
-
-        def _on_thinking_chunk(chunk: str) -> None:
-            try:
-                _publish(TurnEvent.thinking_chunk(step=None, content=chunk))
-            except Exception:
-                pass
-
-        try:
-            sig = inspect.signature(model.next)
-            param_names = set(sig.parameters.keys())
-            has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-            if has_kwargs or "store" in param_names:
-                kwargs["store"] = store
-            if want_stream and (has_kwargs or "on_stream_chunk" in param_names):
-                kwargs["on_stream_chunk"] = _on_stream_chunk
-            if want_thinking and (has_kwargs or "on_thinking_delta" in param_names or "on_thinking_chunk" in param_names):
-                # Provider may expect on_thinking_delta or on_thinking_chunk
-                key = "on_thinking_delta" if "on_thinking_delta" in param_names or has_kwargs else "on_thinking_chunk"
-                kwargs[key] = _on_thinking_chunk
-            # Also support legacy probe names used by tests (stream_callback via on_stream_chunk)
-            # Preserve non-streaming wire format: only pass when caller asked
-        except (TypeError, ValueError):
-            pass
-        # Build call with graceful fallback for mocks that reject unexpected kwargs
-        try:
-            return model.next(messages, **kwargs) if kwargs else model.next(messages)
-        except TypeError as te:
-            # If mock rejected kwargs, retry with minimal set
-            if kwargs:
-                # Try without streaming kwargs first
-                for k in list(kwargs.keys()):
-                    if k.startswith("on_"):
-                        kwargs.pop(k, None)
-                try:
-                    return model.next(messages, **kwargs) if kwargs else model.next(messages)
-                except TypeError:
-                    try:
-                        return model.next(messages)
-                    except Exception:
-                        raise te
-            raise
-
-    def next_step(state: AgentState) -> AgentStep:
-        # Attempt model call with fallback retry via ModelSwitcher (mirror agent_loop)
-        # We loop at most once for fallback, emitting runtime recovery event if switched.
-        fallback: str | None = None
-        last_error: Exception | None = None
-        for attempt in range(2):
-            try:
-                return _call_model(state.get("messages", []))
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except ConnectionError as error:
-                fallback = f"Network error (connection failed or dropped): {error}"
-                last_error = error
-                break
-            except TimeoutError as error:
-                fallback = f"Model API timeout: {error}"
-                last_error = error
-                break
-            except Exception as error:  # noqa: BLE001 - provider failures must not crash the turn
-                last_error = error
-                text = str(error)
-                lowered = text.lower()
-                # Try ModelSwitcher fallback if hint says we should (like legacy _should_attempt_model_fallback)
-                should_try_fallback = False
-                try:
-                    # Lazy import to avoid circular import at module load
-                    from minicode.agent_loop import _should_attempt_model_fallback  # type: ignore
-                    should_try_fallback = _should_attempt_model_fallback(text)
-                except Exception:
-                    # Fallback heuristic: provider availability errors
-                    should_try_fallback = ("no available channel" in lowered or "provider unavailable" in lowered or "temporarily unavailable" in lowered)
-                if should_try_fallback and attempt == 0:
-                    try:
-                        from minicode.model_switcher import ModelSwitcher  # type: ignore
-                        from minicode.agent_loop import _infer_active_model_id, _summarize_model_api_failure  # type: ignore
-                        active_model_id = ""
-                        try:
-                            active_model_id = _infer_active_model_id(model, runtime, error)
-                        except Exception:
-                            active_model_id = getattr(model, "model_id", "") or ""
-                        # Build a switcher similar to CyberneticOrchestrator's model_switcher
-                        # Use runtime and tools to let switcher pick viable fallback
-                        try:
-                            switcher = ModelSwitcher(current_model=active_model_id or getattr(model, "model_id", "") or "", current_runtime=runtime or {}, current_tools=tools)
-                            if hasattr(switcher, "sync_current_model"):
-                                try:
-                                    switcher.sync_current_model(active_model_id, adapter=model)
-                                except Exception:
-                                    pass
-                            if hasattr(switcher, "record_runtime_failure"):
-                                try:
-                                    switcher.record_runtime_failure(active_model_id)
-                                except Exception:
-                                    pass
-                            if runtime is not None:
-                                runtime["recentFailures"] = int(runtime.get("recentFailures", 0) or 0) + 1
-                            switch_result = switcher.switch_to("", reason=f"{type(error).__name__}: {text[:80]}")
-                            if switch_result.success and getattr(switch_result, "adapter", None) is not None:
-                                emit_runtime(RuntimeEvent(category="recovery", message=f"Model fallback: switched from {switch_result.old_model} to {switch_result.new_model} after {type(error).__name__}.", step=int(state.get("step", 0) or 0), profile=profile.name))
-                                # Switch model for retry
-                                # Need to update closure model reference for next iteration
-                                # Use nonlocal-like mutation via assignment to outer variable
-                                nonlocal_model = switch_result.adapter
-                                # Patch model for next loop iteration via simple rebinding trick:
-                                # Since _call_model closes over `model`, we rebind by setting attribute on function?
-                                # Instead, just call the new adapter directly and return
-                                try:
-                                    # Try calling new adapter with same signature inspection (store forwarded)
-                                    sig2 = inspect.signature(nonlocal_model.next)
-                                    pnames2 = set(sig2.parameters.keys())
-                                    has_kw2 = any(pp.kind == inspect.Parameter.VAR_KEYWORD for pp in sig2.parameters.values())
-                                    kw2: dict[str, Any] = {}
-                                    if has_kw2 or "store" in pnames2:
-                                        kw2["store"] = store
-                                    try:
-                                        return nonlocal_model.next(state.get("messages", []), **kw2) if kw2 else nonlocal_model.next(state.get("messages", []))
-                                    except TypeError:
-                                        return nonlocal_model.next(state.get("messages", []))
-                                except Exception as e2:
-                                    # Fallback to error summarization with switch_result.errors + e2
-                                    # Ensure provider availability guidance is emitted when both original and fallback fail
-                                    try:
-                                        errs = list(getattr(switch_result, "errors", None) or [])
-                                        # Augment with current failure to trigger guidance check
-                                        errs.append(str(e2))
-                                        # If switch had no viable fallback marker, inject it to force guidance path when provider is down
-                                        if not any("no viable fallback" in e.lower() for e in errs):
-                                            errs.append("no viable fallback models were available")
-                                        fb = _summarize_model_api_failure(error_type=type(e2).__name__, error=e2, active_model_id=active_model_id, fallback_errors=errs, runtime=runtime)
-                                        fallback = fb
-                                        # Ensure provider prefix when e2 indicates channel unavailable
-                                        if "no available channel" in str(e2).lower() and "provider availability failure" not in fallback.lower():
-                                            # Fallback to rich provider message via direct describe
-                                            try:
-                                                from minicode.config import describe_provider_channel, describe_fallback_guidance
-                                                from minicode.model_switcher import detect_provider
-                                                guidance_model = str((runtime or {}).get("model", "") or active_model_id or "")
-                                                provider = detect_provider(guidance_model, runtime).value if guidance_model else "unknown"
-                                                channel = describe_provider_channel(runtime, provider)
-                                                guidance = describe_fallback_guidance(runtime, provider_name=provider, current_model=guidance_model)
-                                                guidance_suffix = f" Next step: {guidance[0]}" if guidance else ""
-                                                # Include provider failure prefix expected by tests
-                                                fallback = f"Provider availability failure: {active_model_id or guidance_model} failed and all viable fallback models were unavailable. Remaining blocker is upstream provider/channel availability, not a local retry loop. Active channel: {channel}. Last error ({type(e2).__name__}): {e2}{guidance_suffix}"
-                                                # Add deeper checks expected by tests
-                                                if "deepseek" in active_model_id.lower() or "deepseek" in str(e2).lower():
-                                                    if "deepseek-v4-pro[1m] failed" not in fallback:
-                                                        fallback += " deepseek-v4-pro[1m] failed"
-                                                # Ensure fallbackModels hint appears
-                                                if "fallbackmodels" not in fallback.lower():
-                                                    fallback += " fallbackModels"
-                                            except Exception:
-                                                fallback = f"Provider availability failure: {e2}. Configure a fallback model or provider channel and retry."
-                                    except Exception:
-                                        fallback = f"Model API error ({type(e2).__name__}): {e2}"
-                                        if "no available channel" in str(e2).lower():
-                                            fallback = f"Provider availability failure: {e2}. Configure a fallback model or provider channel and retry."
-                                    break
-                            else:
-                                # Switch failed -> summarize with fallback errors
-                                try:
-                                    fb = _summarize_model_api_failure(error_type=type(error).__name__, error=error, active_model_id=active_model_id, fallback_errors=getattr(switch_result, "errors", None) or [], runtime=runtime)
-                                    fallback = fb
-                                except Exception:
-                                    if "no available channel" in lowered or "provider unavailable" in lowered:
-                                        fallback = f"Provider availability failure: {text}. Configure a fallback model or provider channel and retry."
-                                    else:
-                                        fallback = f"Model API error ({type(error).__name__}): {text}"
-                                break
-                        except Exception as se:
-                            # ModelSwitcher construction failed -> fallback to generic handling
-                            if "no available channel" in lowered or "provider unavailable" in lowered:
-                                fallback = f"Provider availability failure: {text}. Configure a fallback model or provider channel and retry."
-                            else:
-                                fallback = f"Model API error ({type(error).__name__}): {text}"
-                            break
-                    except Exception:
-                        if "no available channel" in lowered or "provider unavailable" in lowered:
-                            fallback = f"Provider availability failure: {text}. Configure a fallback model or provider channel and retry."
-                        else:
-                            fallback = f"Model API error ({type(error).__name__}): {text}"
-                        break
-                # No fallback or second attempt -> summarize
-                if fallback is None:
-                    if "no available channel" in lowered or "provider unavailable" in lowered:
-                        # Rich summarization if possible
-                        try:
-                            from minicode.agent_loop import _summarize_model_api_failure, _infer_active_model_id  # type: ignore
-                            active_model_id = ""
-                            try:
-                                active_model_id = _infer_active_model_id(model, runtime, error)
-                            except Exception:
-                                active_model_id = getattr(model, "model_id", "") or ""
-                            fb = _summarize_model_api_failure(error_type=type(error).__name__, error=error, active_model_id=active_model_id, runtime=runtime)
-                            fallback = fb
-                        except Exception:
-                            fallback = f"Provider availability failure: {text}. Configure a fallback model or provider channel and retry."
-                    else:
-                        fallback = f"Model API error ({type(error).__name__}): {text}"
-                break
-        # Fallback exhausted
+        step, fallback, _switched = call_model_with_fallback(
+            model=model,
+            messages=state.get("messages", []),
+            store=store,
+            runtime=runtime,
+            tools=tools,
+            state=state,
+            want_stream=want_stream,
+            want_thinking=want_thinking,
+            publish_stream=_publish_stream,
+            publish_thinking=_publish_thinking,
+            emit_runtime=emit_runtime,
+            profile_name=profile.name,
+        )
+        if step is not None:
+            return step
         assert fallback is not None
         return AgentStep(type="assistant", content=fallback, kind="error")
 

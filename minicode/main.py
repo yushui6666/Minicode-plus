@@ -149,6 +149,18 @@ def _handle_list_sessions_request(cwd: str, *, workspace_only: bool) -> int:
 def _handle_readiness_request(cwd: str, *, json_output: bool) -> int:
     if json_output:
         from minicode.product_surfaces import build_readiness_report
+from minicode.skill_hotlist import get_hot_skills_for_prompt
+
+
+def _get_prompt_skills(cwd: str, tools, query: str | None = None) -> list[dict]:
+    """Hotlist Top20 for prompt injection (BM25-reranked by query), fallback to full discover."""
+    try:
+        return get_hot_skills_for_prompt(cwd, query=query)
+    except Exception:
+        try:
+            return tools.get_skills() if tools else []
+        except Exception:
+            return []
 
         print(
             json.dumps(
@@ -514,7 +526,7 @@ def main() -> None:
         cwd,
         permissions.get_summary(),
         {
-            "skills": tools.get_skills(),
+            "skills": _get_prompt_skills(cwd, tools),
             "mcpServers": tools.get_mcp_servers(),
             "memory_context": memory_mgr.get_relevant_context(),  # Inject memory
             "runtime": runtime,
@@ -602,7 +614,7 @@ def main() -> None:
                     cwd,
                     permissions.get_summary(),
                     {
-                        "skills": tools.get_skills(),
+                        "skills": _get_prompt_skills(cwd, tools, query=user_input),
                         "mcpServers": tools.get_mcp_servers(),
                         "memory_context": memory_mgr.get_relevant_context(query=user_input),
                         "runtime": runtime,
