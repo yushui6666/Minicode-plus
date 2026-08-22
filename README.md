@@ -160,49 +160,49 @@ python -m minicode.structure_check
 python -m pytest tests/ -q
 ```
 
-## Memory system
+## 记忆系统（Memory）
 
-MiniCode-plus includes closed-loop, cross-session memory through the unified `MemoryPipeline` entry point (`minicode/memory_pipeline.py`). Four operations cover the lifecycle:
+内置闭环控制式跨会话记忆，统一入口 `MemoryPipeline`（`minicode/memory_pipeline.py`），四个动词覆盖完整生命周期：
 
-| Operation | When | Behavior |
+| 动词 | 时机 | 行为 |
 | --- | --- | --- |
-| `read` | Task start | Classify the domain, combine BM25 and vector RRF retrieval, then let the LLM select; route relational and temporal questions to the memory graph automatically |
-| `inject` | Prompt assembly | Use PID feedback control to decide how much memory to inject and how strict the threshold should be, then append it to the system prompt |
-| `write` | Task end | Distill the execution trace (decisions, lessons, and improvement points) with ReflectionEngine before persisting it |
-| `maintain` | Periodic background work | Merge insights, detect stale memories, and archive duplicates with CuratorAgent |
+| `read` | 任务开始 | 领域分类 → BM25 → 向量 RRF 融合 → LLM 精选；关系型/时序问题自动路由记忆图谱 |
+| `inject` | 提示词组装 | PID 反馈控制决定注多少、注多严，追加进 system prompt |
+| `write` | 任务结束 | ReflectionEngine 蒸馏执行轨迹（决策/教训/改进点）后落盘 |
+| `maintain` | 后台周期 | CuratorAgent 合并洞察、校验过时、归档重复 |
 
-### Storage model
+### 存储模型
 
-Scope and tier are orthogonal:
+Scope 与 Tier 双维度正交：
 
-- Scope: USER (`~/.mini-code/memory/`, shared across projects), PROJECT (`.mini-code-memory/`, shared with the repository), and LOCAL (`.mini-code-memory-local/`, local and not committed)
-- Tier: WORKING → SHORT_TERM (<7 days) → LONG_TERM (<30 days, compressed) → ARCHIVAL (permanent summary)
+- Scope：USER（~/.mini-code/memory/，跨项目）/ PROJECT（.mini-code-memory/，随仓库共享）/ LOCAL（.mini-code-memory-local/，本地不入库）
+- Tier：WORKING → SHORT_TERM（<7 天）→ LONG_TERM（<30 天，压缩）→ ARCHIVAL（永久摘要）
 
-Writes are atomic. Loading performs structural validation and self-healing for corrupted data, while remaining compatible with hand-written `MEMORY.md` files.
+落盘走原子写入，加载带结构校验与损坏自愈，兼容手写 MEMORY.md。
 
-### Memory graph and superseded audit
+### 记忆图谱与 superseded 审计
 
-Facts are stored as quadruples (subject, predicate, value, source, confidence, and validity window). When a new fact supersedes an old one, the old fact is marked rather than deleted: its `valid_to` timestamp and a `supersedes` audit edge preserve the history. Current queries see only valid facts; point-in-time queries replay the graph to recover what was believed at that time. Contradictions are marked `disputed`, allowing retrieval to express an explicit preference instead of silently choosing a side.
+事实以四元组存储（subject-predicate-value + 出处 + 置信度 + 生效时间窗）。旧事实被新事实取代时**只标记不删除**：盖 valid_to 时间戳并建立 supersedes 审计边。当前查询只见有效事实；历史查询按时间点重放，可精确还原"当时相信什么"。矛盾事实标记 disputed，检索层可显式表达偏好而非静默选边。
 
-### Injection control loop
+### 注入控制闭环
 
-Injection volume is feedback-controlled rather than a static limit:
+注入量是反馈回路而非静态上限：
 
-- At ≥75% context usage, switch to SUMMARY mode and reduce injection; at ≥90%, stop injecting
-- Low retrieval quality reduces volume and raises the threshold; user corrections tighten it per occurrence as a memory-confidence signal
-- Recent failures add STRONG-mode experience; repeated tasks can reuse memory directly
+- 上下文占用 ≥75% 切 SUMMARY 档减量，≥90% 停注
+- 检索质量低 → 减量提门槛；用户纠正 → 按次收紧（记忆可信度信号）
+- 最近失败 → STRONG 档补经验；重复任务 → 允许直接复用
 
-The stability score produced by `AdaptivePIDTuner` (Ziegler-Nichols, relay feedback, or gradient self-tuning) flows through `update_control_state()` into the injection decision as adaptive PID trim, so tuned gains affect every injection.
+AdaptivePIDTuner（Ziegler-Nichols / 继电反馈 / 梯度自整定）产出的稳定性评分经 update_control_state() 直通注入决策（adaptive PID trim）——整定增益真实作用于每次注入。
 
-### Failure recovery
+### 失败恢复通道
 
-When a turn contains a tool error, the pipeline automatically retrieves similar historical failures and their solutions. The next turn receives these as Failure Recovery Notes without requiring an explicit caller trigger.
+回合轨迹包含工具错误时，自动检索相似历史失败与解法，下一轮以 Failure Recovery Notes 注入，无需调用方显式触发。
 
-### Main-loop integration
+### 主循环挂载
 
-Both the interactive CLI loop and the headless entry load context through the pipeline. Each turn is reflected and persisted automatically, and maintenance runs once every 10 writes.
+CLI 交互循环与 headless 入口均经管线取上下文；每回合结束自动反思落盘，每 10 次 write 触发一次维护巡检。
 
-> **Overhead kill-switch:** set `MINICODE_MEMORY_PIPELINE=0` (also accepts `false/off/no/disable`) to skip the pipeline entirely. `MemoryManager.get_relevant_context()` remains, but `MemoryPipeline.read/write/maintain/inject` become no-ops — useful for large repos or low-cost CI where the ~5-file wiring adds visible latency. Re-enable by unsetting or setting `=1`.
+> **开销兜底开关：** 设置 `MINICODE_MEMORY_PIPELINE=0`（亦接受 `false/off/no/disable`）即可跳过整条管线，仅保留 `MemoryManager.get_relevant_context()` 的基础上下文；`MemoryPipeline.read/write/maintain/inject` 全部短路为 no-op，适合大仓/低配 CI 降延迟。取消或设为 `1` 即恢复。
 
 ## Release verification
 
@@ -217,5 +217,5 @@ python -m minicode.release_readiness --check-release-markdown benchmarks/release
 ## TODO
 
 - [ ] 多 Agent 协调（基于现有 thread_id 检查点做父子图）
-- [ ] 重写记忆系统
+- [x] ~~重写记忆系统~~（已完成：MemoryPipeline 四动词闭环 + PID 注入控制 + 失败恢复通道 + 图谱 superseded 审计 + 开销开关 MINICODE_MEMORY_PIPELINE=0）
 - [x] ~~重写 Skill 载入~~（已完成：热榜 Top20 + BM25 任务相关性二排）

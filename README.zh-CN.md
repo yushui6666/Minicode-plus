@@ -217,5 +217,5 @@ python -m minicode.release_readiness --check-release-markdown benchmarks/release
 ## TODO
 
 - [ ] 多 Agent 协调（基于现有 thread_id 检查点做父子图）
-- [ ] 重写记忆系统
+- [x] ~~重写记忆系统~~（已完成：MemoryPipeline 四动词闭环 + PID 注入控制 + 失败恢复通道 + 图谱 superseded 审计 + 开销开关 MINICODE_MEMORY_PIPELINE=0）
 - [x] ~~重写 Skill 载入~~（已完成：热榜 Top20 + BM25 任务相关性二排）
