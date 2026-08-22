@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    # Keep the test process hermetic: a developer-local project .env must
+    # never leak provider credentials into provider-detection assertions.
+    # Tests that exercise the .env loader itself opt back in explicitly.
+    os.environ.setdefault("MINICODE_DISABLE_ENV_FILE", "1")
     config.addinivalue_line("markers", "benchmark: mark test as a benchmark test.")
 
 

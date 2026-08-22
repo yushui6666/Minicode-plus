@@ -342,7 +342,20 @@ class OpenAIModelAdapter:
             choice = choices[0]
             message = choice.get("message", {})
             text_content = message.get("content", "") or ""
+            reasoning_content = (
+                message.get("reasoning_content") or message.get("reasoning") or ""
+            )
             tool_calls_raw = message.get("tool_calls", [])
+            
+            if reasoning_content and on_thinking_delta:
+                # Reasoning models (DeepSeek R1 style) deliver the chain of
+                # thought separately from the visible content. Non-streaming
+                # delivers it whole; emit it as one delta so consumers that
+                # opted into thinking chunks can render it.
+                try:
+                    on_thinking_delta(reasoning_content)
+                except Exception:
+                    pass
             
             stop_reason = choice.get("finish_reason")
             
@@ -427,6 +440,17 @@ class OpenAIModelAdapter:
             if content:
                 text_parts.append(content)
                 on_stream_chunk(content)
+            
+            # Reasoning content — DeepSeek R1 / vLLM gateways stream it as
+            # ``reasoning_content``, OpenRouter as ``reasoning``. Forward each
+            # fragment as it arrives so thinking-chunk consumers render the
+            # chain of thought live while the final content is still pending.
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+            if reasoning and on_thinking_delta:
+                try:
+                    on_thinking_delta(reasoning)
+                except Exception:
+                    pass
             
             # Tool calls (incremental)
             tc_deltas = delta.get("tool_calls", [])

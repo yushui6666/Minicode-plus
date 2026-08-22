@@ -15,7 +15,12 @@ from minicode.logging_config import get_logger
 from minicode.model_registry import detect_provider
 from minicode.permissions import PermissionManager
 from minicode.state import Store, AppState, increment_tool_calls, set_busy, set_idle
-from minicode.tooling import ToolContext, ToolRegistry, ToolResult
+from minicode.tooling import (
+    ToolContext,
+    ToolRegistry,
+    ToolResult,
+    resolve_tool_timeout,
+)
 from minicode.types import (
     AgentStep,
     ChatMessage,
@@ -406,13 +411,7 @@ def _execute_single_tool(
         
         # Execute the tool with timeout protection
         import concurrent.futures
-        import os
-        _base_timeout = int(os.environ.get("MINICODE_TOOL_TIMEOUT", "120"))
-        TOOL_TIMEOUT = (
-            int(getattr(tool_scheduler, '_force_tool_timeout', _base_timeout))
-            if tool_scheduler and hasattr(tool_scheduler, '_force_tool_timeout')
-            else _base_timeout
-        )
+        TOOL_TIMEOUT = resolve_tool_timeout(tool_name, tools, tool_scheduler)
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(

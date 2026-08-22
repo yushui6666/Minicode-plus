@@ -130,6 +130,9 @@ def test_load_runtime_config_includes_runtime_profile(monkeypatch) -> None:
         },
     )
     monkeypatch.delenv("MINI_CODE_RUNTIME_PROFILE", raising=False)
+    # Isolate from a developer-local project .env (see _load_env_file):
+    # these tests assert env-var fallback chains with a pristine env.
+    monkeypatch.setattr(config_module, "_load_env_file", lambda path: {})
     monkeypatch.delenv("MINI_CODE_MODEL", raising=False)
     monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -153,6 +156,9 @@ def test_load_runtime_config_includes_anthropic_family_defaults(monkeypatch) -> 
             },
         },
     )
+    # Isolate from a developer-local project .env (see _load_env_file):
+    # these tests assert env-var fallback chains with a pristine env.
+    monkeypatch.setattr(config_module, "_load_env_file", lambda path: {})
     monkeypatch.delenv("MINI_CODE_MODEL", raising=False)
     monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -216,6 +222,9 @@ def test_load_runtime_config_prefers_settings_env_for_openai_runtime(monkeypatch
     )
     monkeypatch.setenv("OPENAI_BASE_URL", "https://stale.example.com")
     monkeypatch.setenv("OPENAI_API_KEY", "stale-openai-token")
+    # Isolate from a developer-local project .env (see _load_env_file):
+    # these tests assert env-var fallback chains with a pristine env.
+    monkeypatch.setattr(config_module, "_load_env_file", lambda path: {})
     monkeypatch.delenv("MINI_CODE_MODEL", raising=False)
     monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
 
@@ -258,6 +267,9 @@ def test_load_runtime_config_includes_structured_fallback_models(monkeypatch) ->
             "env": {"ANTHROPIC_API_KEY": "test-key"},
         },
     )
+    # Isolate from a developer-local project .env (see _load_env_file):
+    # these tests assert env-var fallback chains with a pristine env.
+    monkeypatch.setattr(config_module, "_load_env_file", lambda path: {})
     monkeypatch.delenv("MINI_CODE_MODEL", raising=False)
     monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -432,6 +444,9 @@ def test_load_runtime_config_falls_back_to_model_for_missing_anthropic_family_de
             },
         },
     )
+    # Isolate from a developer-local project .env (see _load_env_file):
+    # these tests assert env-var fallback chains with a pristine env.
+    monkeypatch.setattr(config_module, "_load_env_file", lambda path: {})
     monkeypatch.delenv("MINI_CODE_MODEL", raising=False)
     monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)

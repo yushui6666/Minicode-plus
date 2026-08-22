@@ -15,7 +15,12 @@ from minicode.graph.builder import (
     build_model_graph,
 )
 from minicode.runtime_profiles import resolve_runtime_profile
-from minicode.tooling import ToolContext, ToolRegistry, ToolResult
+from minicode.tooling import (
+    ToolContext,
+    ToolRegistry,
+    ToolResult,
+    resolve_tool_timeout,
+)
 from minicode.turn_events import TurnEvent
 from minicode.types import AgentStep, ChatMessage, ModelAdapter, RuntimeEvent
 from minicode.working_memory import protect_context
@@ -40,10 +45,7 @@ def _execute_single_tool(
 
     tool_name = call["toolName"]
     tool_input = call["input"]
-    base_timeout = int(os.environ.get("MINICODE_TOOL_TIMEOUT", "120"))
-    tool_timeout = int(
-        getattr(tool_scheduler, "_force_tool_timeout", base_timeout)
-    )
+    tool_timeout = resolve_tool_timeout(tool_name, tools, tool_scheduler)
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(
@@ -391,6 +393,16 @@ def run_graph_turn(
                 }
             ]
 
+        # Tool runtime for this turn: expose the parent turn's registry and
+        # model adapter to tool implementations. The sub-agent ``task`` tool
+        # reuses both instead of rebuilding a registry/adapter per spawn.
+        tool_runtime: dict[str, Any] = {
+            **(runtime or {}),
+            "toolRegistry": tools,
+            "modelAdapter": model,
+            "turnCallbacks": callbacks,
+        }
+
         results: list[tuple[dict[str, Any], ToolResult]] = []
         concurrent_ids: set[int] = set()
 
@@ -398,7 +410,7 @@ def run_graph_turn(
             call = calls[0]
             _fire_tool_start(call["toolName"], call["input"])
             result = _execute_single_tool(
-                call, tools, cwd, permissions, session, runtime, tool_scheduler
+                call, tools, cwd, permissions, session, tool_runtime, tool_scheduler
             )
             _fire_tool_result(call["toolName"], result.output, not result.ok)
             results.append((call, result))
@@ -432,7 +444,7 @@ def run_graph_turn(
                             cwd,
                             permissions,
                             session,
-                            runtime,
+                            tool_runtime,
                             tool_scheduler,
                         ): call
                         for call in concurrent_calls
@@ -453,7 +465,7 @@ def run_graph_turn(
             for call in serial_calls:
                 _fire_tool_start(call["toolName"], call["input"])
                 result = _execute_single_tool(
-                    call, tools, cwd, permissions, session, runtime, tool_scheduler
+                    call, tools, cwd, permissions, session, tool_runtime, tool_scheduler
                 )
                 _fire_tool_result(call["toolName"], result.output, not result.ok)
                 results.append((call, result))

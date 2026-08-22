@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -234,6 +235,11 @@ class ToolDefinition:
     validator: Validator
     run: Runner
     metadata: ToolMetadata | None = None
+    # Declared wall-clock budget for one execution of this tool, in seconds.
+    # Long-running structural tools (e.g. the sub-agent ``task`` tool) declare
+    # this so the generic MINICODE_TOOL_TIMEOUT default cannot kill them;
+    # ``resolve_tool_timeout`` treats it as authoritative when set.
+    timeout_seconds: int | None = None
     
     @property
     def is_read_only(self) -> bool:
@@ -250,6 +256,32 @@ class ToolDefinition:
             return self.metadata.is_concurrency_safe or self.metadata.is_read_only
         return self.is_read_only
 
+
+def resolve_tool_timeout(
+    tool_name: str,
+    tools: ToolRegistry | None,
+    tool_scheduler: Any | None = None,
+) -> int:
+    """Resolve the execution timeout (seconds) for one tool call.
+
+    Priority order:
+
+    1. ``ToolDefinition.timeout_seconds`` declared by the tool itself — a tool
+       that knows it is long-running (sub-agent spawning) must not be killed
+       by a generic default or by an adaptively tightened global cap.
+    2. ``tool_scheduler._force_tool_timeout`` — the scheduler's dynamic
+       override, honored for tools without a declared budget.
+    3. ``MINICODE_TOOL_TIMEOUT`` env var, default 120s.
+    """
+    if tools is not None:
+        definition = tools.find(tool_name)
+        declared = getattr(definition, "timeout_seconds", None)
+        if declared:
+            return int(declared)
+    forced = getattr(tool_scheduler, "_force_tool_timeout", None)
+    if forced is not None:
+        return int(forced)
+    return int(os.environ.get("MINICODE_TOOL_TIMEOUT", "120"))
 
 # Heuristic: tool names that are known to be read-only
 _READ_ONLY_TOOL_NAMES: frozenset[str] = frozenset({

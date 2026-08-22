@@ -11,11 +11,19 @@ The sub-agent runs a full agent loop (model + tools) with:
 """
 from __future__ import annotations
 
+import os
+import threading
 import time
-from typing import TypedDict, cast
+from typing import Any, TypedDict, cast
 
 from minicode.graph import run_graph_turn
-from minicode.tooling import ToolDefinition, ToolResult
+from minicode.tooling import (
+    ToolCapability,
+    ToolDefinition,
+    ToolMetadata,
+    ToolResult,
+)
+from minicode.turn_events import TurnEvent
 from minicode.types import ChatMessage
 
 
@@ -90,6 +98,70 @@ def _validate(input_data: dict) -> dict:
     }
 
 
+def _resolve_max_depth() -> int:
+    """Maximum sub-agent generation depth (1 = sub-agents cannot spawn)."""
+    try:
+        return max(1, int(os.environ.get("MINICODE_SUBAGENT_MAX_DEPTH", "1")))
+    except ValueError:
+        return 1
+
+
+
+def _resolve_max_concurrency() -> int:
+    """Global cap on simultaneously running sub-agents (fan-out width)."""
+    try:
+        return max(1, int(os.environ.get("MINICODE_SUBAGENT_MAX_CONCURRENCY", "4")))
+    except ValueError:
+        return 4
+
+
+_SUBAGENT_SLOT_LOCK = threading.Lock()
+_SUBAGENT_SLOTS: threading.Semaphore | None = None
+
+
+def _get_subagent_slots() -> threading.Semaphore:
+    """Lazily build the process-wide sub-agent slot semaphore."""
+    global _SUBAGENT_SLOTS
+    with _SUBAGENT_SLOT_LOCK:
+        if _SUBAGENT_SLOTS is None:
+            _SUBAGENT_SLOTS = threading.Semaphore(_resolve_max_concurrency())
+        return _SUBAGENT_SLOTS
+
+
+class _SubagentEventForwarder:
+    """Bubbles a sub-agent's turn events up to the parent event queue.
+
+    The parent turn is blocked inside the task tool while the sub-agent
+    runs; forwarding a curated subset (phase progress, tool starts, tool
+    failures) as prefixed progress messages keeps the TUI live instead of
+    silent for the whole sub-turn. Thinking/stream chunks are deliberately
+    NOT forwarded — they would interleave confusingly with the parent's
+    own (already finished) streams.
+    """
+
+    def __init__(self, parent_callbacks: Any, label: str) -> None:
+        self._parent = parent_callbacks
+        self._prefix = f"[sub:{label}]"
+        # The graph runtime inspects these flags to decide whether to
+        # request stream/thinking callbacks from the model adapter; the
+        # sub-agent keeps both channels off.
+        self.include_stream_chunks = False
+        self.include_thinking_chunks = False
+
+    def on_event(self, event: TurnEvent) -> None:
+        forward: str | None = None
+        if event.kind == "progress":
+            forward = event.content
+        elif event.kind == "tool_start":
+            forward = f"\u25b6 {event.tool_name}"
+        elif event.kind == "tool_result" and event.is_error:
+            forward = f"\u2717 {event.tool_name} failed"
+        if forward:
+            self._parent.on_event(
+                TurnEvent.progress_message(step=None, content=f"{self._prefix} {forward}")
+            )
+
+
 def _run(input_data: dict, context) -> ToolResult:
     """Execute a sub-agent task.
     
@@ -103,50 +175,73 @@ def _run(input_data: dict, context) -> ToolResult:
     from minicode.permissions import PermissionManager
     from minicode.tools import create_default_tool_registry
     
-    agent_type = input_data["agent_type"]
+    agent_type = input_data.get("agent_type", "general")
     agent_def = AGENT_TYPES[agent_type]
-    task_prompt = input_data["prompt"]
-    
-    # Try to get the model from context or fall back to creating one
-    # The context object carries runtime info needed for the model adapter
-    runtime = None
-    model = None
-    
-    # Attempt to extract runtime from the ToolContext
-    if hasattr(context, '_runtime') and context._runtime:
-        runtime = context._runtime
-    
+    task_prompt = input_data.get("prompt") or input_data.get("description", "")
+
+    # Runtime comes from the parent turn's ToolContext when available (the
+    # graph runtime injects reuse handles there), else fall back to config.
+    runtime = getattr(context, "_runtime", None) or None
+
     if not runtime:
-        # Try loading from config
         try:
             from minicode.config import load_runtime_config
             runtime = load_runtime_config(context.cwd)
         except Exception:
-            pass
-    
+            runtime = None
+
     if not runtime:
         return ToolResult(
             ok=False,
             output="Cannot run sub-agent: no model configuration available. Set ANTHROPIC_API_KEY and ANTHROPIC_MODEL."
         )
-    
-    # Create a filtered tool registry for this agent type
-    full_tools = create_default_tool_registry(context.cwd, runtime=runtime)
-    allowed = agent_def["allowed_tools"]
-    
-    if allowed is not None:
-        filtered_tools = [t for t in full_tools.list() if t.name in allowed]
-        from minicode.tooling import ToolRegistry
-        tools = ToolRegistry(filtered_tools)
+
+    # Recursion guard: depth counts spawned generations (0 = top-level
+    # turn). The sub-agent receives depth+1 in its runtime, so a nested
+    # 'task' call is rejected — and the tool stripped from its registry —
+    # once the configured cap is reached.
+    depth = int(runtime.get("subagentDepth", 0) or 0)
+    max_depth = _resolve_max_depth()
+    if depth >= max_depth:
+        return ToolResult(
+            ok=False,
+            output=(
+                f"Sub-agent spawn rejected: depth limit reached "
+                f"(depth={depth}, max={max_depth}). "
+                "Complete the task directly with your own tools."
+            ),
+        )
+
+    # Tool registry: reuse the parent turn's registry when injected (the
+    # graph runtime provides it) instead of redoing skill discovery and
+    # MCP server connections per spawn.
+    parent_registry = runtime.get("toolRegistry")
+    if parent_registry is not None:
+        full_tools = parent_registry
     else:
-        tools = full_tools
-    
-    # Create model adapter
-    model = create_model_adapter(
-        model=runtime.get("model", ""),
-        tools=tools,
-        runtime=runtime,
-    )
+        full_tools = create_default_tool_registry(context.cwd, runtime=runtime)
+
+    allowed = agent_def["allowed_tools"]
+    strip_spawn_tool = depth + 1 >= max_depth
+    filtered_tools = [
+        t
+        for t in full_tools.list()
+        if (allowed is None or t.name in allowed)
+        and (not strip_spawn_tool or t.name != "task")
+    ]
+    from minicode.tooling import ToolRegistry
+    tools = ToolRegistry(filtered_tools)
+
+    # Model: reuse the parent turn's adapter when injected (keeps mock
+    # mode and provider selection identical to the parent); fall back to
+    # creating one from config.
+    model = runtime.get("modelAdapter")
+    if model is None or not hasattr(model, "next"):
+        model = create_model_adapter(
+            model=runtime.get("model", ""),
+            tools=tools,
+            runtime=runtime,
+        )
     
     # Create isolated permissions (no prompts — auto-deny writes for read-only agents)
     if agent_def["allowed_tools"] is not None:
@@ -172,19 +267,42 @@ def _run(input_data: dict, context) -> ToolResult:
         },
     ])
     
-    # Run the sub-agent loop
+    # Run the sub-agent loop. The sub runtime carries depth+1 and the
+    # reuse handles so a nested spawn attempt is rejected at the cap.
+    # graphCheckpoint is stripped: sub-agents stay checkpoint-free so a
+    # parallel fan-out never contends on one sqlite checkpointer file.
     start_time = time.time()
     max_turns = agent_def["max_turns"]
-    
+    sub_runtime = {
+        key: value for key, value in runtime.items() if key != "graphCheckpoint"
+    }
+    sub_runtime.update(
+        {
+            "subagentDepth": depth + 1,
+            "toolRegistry": tools,
+            "modelAdapter": model,
+        }
+    )
+
+    # Event bubbling: forward a curated subset of the sub-agent's turn
+    # events to the parent queue as prefixed progress messages.
+    parent_callbacks = runtime.get("turnCallbacks")
+    forwarder = None
+    if parent_callbacks is not None and callable(getattr(parent_callbacks, "on_event", None)):
+        forwarder = _SubagentEventForwarder(parent_callbacks, agent_def["name"])
+
     try:
-        result_messages = run_graph_turn(
-            model=model,
-            tools=tools,
-            messages=sub_messages,
-            cwd=context.cwd,
-            permissions=sub_permissions,
-            max_steps=max_turns,
-        )
+        with _get_subagent_slots():
+            result_messages = run_graph_turn(
+                model=model,
+                tools=tools,
+                messages=sub_messages,
+                cwd=context.cwd,
+                permissions=sub_permissions,
+                max_steps=max_turns,
+                runtime=sub_runtime,
+                callbacks=forwarder,
+            )
     except Exception as e:
         return ToolResult(
             ok=False,
@@ -254,4 +372,15 @@ task_tool = ToolDefinition(
     },
     validator=_validate,
     run=_run,
+    # Concurrency-safe: a model batch of N task calls fans out in the
+    # scheduler's parallel phase, bounded by the slot semaphore above.
+    metadata=ToolMetadata(
+        name="task",
+        description="Sub-agent spawn (parallel fan-out, slot-capped)",
+        capabilities={ToolCapability.CONCURRENCY_SAFE},
+    ),
+    # One sub-agent turn easily runs for minutes; the generic 120s
+    # default would kill it. resolve_tool_timeout treats this as
+    # authoritative over the env default and scheduler caps.
+    timeout_seconds=600,
 )

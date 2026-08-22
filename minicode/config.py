@@ -517,6 +517,37 @@ def save_mini_code_settings(updates: dict[str, Any]) -> None:
     )
 
 
+def _load_env_file(path: Path) -> dict[str, str]:
+    """Parse a ``.env`` file without external dependencies.
+
+    Supports comments, blank lines, optional ``export `` prefixes, and
+    single/double-quoted values. Later duplicate keys are ignored (first
+    wins), matching common dotenv behaviour.
+    """
+    if not path.is_file():
+        return {}
+    values: dict[str, str] = {}
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.lower().startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {chr(39), chr(34)}:
+            value = value[1:-1]
+        if key and key not in values:
+            values[key] = value
+    return values
+
 def load_runtime_config(
     cwd: str | Path | None = None,
     *,
@@ -526,6 +557,17 @@ def load_runtime_config(
         trust_project_mcp = os.environ.get("MINI_CODE_TRUST_PROJECT_MCP", "").strip().lower() in (
             "1", "true", "yes", "on",
         )
+    # Project .env: fill missing process env vars only (never override
+    # what the caller already exported). This makes the documented
+    # ``cp .env.example .env`` flow work without a dotenv dependency.
+    # Test processes opt out via MINICODE_DISABLE_ENV_FILE=1 (set in
+    # conftest.py) so a developer-local .env cannot leak credentials into
+    # provider-detection assertions across the suite.
+    if os.environ.get("MINICODE_DISABLE_ENV_FILE", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        env_cwd = Path(cwd) if cwd else Path.cwd()
+        for key, value in _load_env_file(env_cwd / ".env").items():
+            os.environ.setdefault(key, value)
+
     load_effective = load_effective_settings
     try:
         signature = inspect.signature(load_effective)

@@ -1,8 +1,8 @@
 # MiniCode-plus
 
-> 终端优先的 AI Coding Agent · Python 3.11+ · LangGraph 图运行时
+> 终端优先的 AI Coding Agent · Python 3.11+ · LangGraph 图运行时 · 多 Agent 扇出编排
 
-MiniCode-plus 是一个轻量级终端编程助手：模型在图中循环「推理 → 鉴权 → 执行工具 → 观测 → 校验」，支持人机暂停恢复、模型故障自动切换、Skill 热榜按任务相关性注入。
+MiniCode-plus 是一个轻量级终端编程助手：模型在图中循环「推理 → 鉴权 → 执行工具 → 观测 → 校验」，支持人机暂停恢复、模型故障自动切换、Skill 热榜按任务相关性注入，并可通过 `task` 工具把子任务扇出给**并行子 Agent**（独立上下文、独立预算、进度实时冒泡）。
 
 ## 快速开始
 
@@ -15,22 +15,117 @@ MINI_CODE_MODEL_MODE=mock python -m minicode.main
 
 # 一次性执行（CI/脚本）
 echo "解释这段代码" | python -m minicode.headless
+
+# 真实供应商：项目根放 .env（自动加载，只补缺失的环境变量）
+#   CUSTOM_API_KEY=sk-...
+#   CUSTOM_API_BASE_URL=https://your-openai-compatible-endpoint/v1
+#   ANTHROPIC_MODEL=your-model
 ```
 
 ### 入口一览
 
 | 命令 | 说明 |
 | --- | --- |
-| `minicode-py` | 交互式 TUI 会话（工具、权限、会话持久化） |
+| `minicode-py` | 交互式 TUI 会话（工具、权限、会话持久化、思考流显示） |
 | `minicode-headless` | 非交互一次性执行，支持 `MINI_CODE_HEADLESS_MESSAGES_OUT` 追踪 |
 | `minicode-readiness` | 供应商/运行时就绪门禁（`--json --fail-on blocked`） |
 | `minicode-structure-check` | AGENTS.md 结构合规扫描 |
-| `minicode-provider-smoke` | 供应商连通冒烟 |
+| `minicode-provider-smoke` | 供应商连通冒烟（`--run-live`，需 `MINICODE_LIVE_PROVIDER_SMOKE=1`） |
+
+## 多 Agent 编排（task 工具）
+
+### 设计决策：子 Agent 即工具，而不是编排节点
+
+多 Agent 化有两条路线：给主图加「编排节点」（动图结构、加路由、加状态字段），或把**子 Agent 做成一个工具**（`task`），模型像调用 `read_file` 一样调用它。MiniCode-plus 选择后者：
+
+- **主图零改动**：`task` 走现有「推理 → 鉴权 → 执行工具 → 观测」路径，权限、预算、校验、事件全部复用；
+- **子 Agent 跑的就是同一张图**：`task` 内部递归调用 `run_graph_turn`（`minicode/graph/runtime.py`），用 `build_model_graph` 构建同构子图——每种子 Agent 类型只换 system prompt（任务书）与工具白名单；
+- **委托决策留给模型**：何时扇出、拆成几个、怎么合并，由父模型自主决定；机制层只负责安全边界。
+
+下图是主拓扑图（见《架构》章节）中 `task` 虚线分支的放大视图——扇出调度与子 Agent 内部结构：
+
+```mermaid
+flowchart TB
+    subgraph PARENT["父回合 · 主图"]
+        MD["模型推理<br/>一次输出 N 个 task 调用"] -->|"并行批"| EX["执行工具<br/>ToolScheduler 并行阶段"]
+    end
+
+    EX -->|"槽位信号量 ≤ 4"| SUB1["子 Agent ① · 同构图递归"]
+    EX --> SUB2["子 Agent ② · 同构图递归"]
+    EX --> SUB3["子 Agent ③ · 同构图递归"]
+
+    subgraph SUB["每个子 Agent = 同一张 build_model_graph"]
+        direction TB
+        BOOK["独立消息列表<br/>system = 专属任务书"] --> LOOP["推理 → 鉴权 → 执行 → 观测 → 校验<br/>独立 max_steps · 工具白名单 · 深度 +1"]
+        LOOP --> REPORT["战报 = 最终 assistant 消息"]
+    end
+
+    SUB1 & SUB2 & SUB3 -.-> SUB
+    REPORT -->|"tool_result 回到父回合"| OBS["观测 → 校验 → 策略检查"]
+    LOOP -.->|"[sub:名] 进度/工具事件冒泡"| TUI["父事件队列 → TUI 实时显示"]
+
+    style EX fill:#fef7e0,stroke:#fbbc04
+    style SUB fill:#e8f0fe,stroke:#4285f4
+    style REPORT fill:#e6f4ea,stroke:#34a853
+```
+
+### 三类子 Agent
+
+| 类型 | 工具白名单 | 步数上限 | 定位 |
+| --- | --- | --- | --- |
+| `explore` | 只读（read/grep/list/tree/symbol） | 5 | 快速探索与检索 |
+| `plan` | 只读 + code_review | 8 | 深度分析与方案 |
+| `general` | 全量（继承父注册表，写操作仍走鉴权） | 15 | 多步实现任务 |
+
+只读类型的子 Agent 拿到独立的 `PermissionManager`（无提示回调 → 写操作自动拒绝）；`general` 继承父的权限提示链。**子权限永远 ⊆ 父权限**。
+
+### 五条机制不变式
+
+实现落在 `minicode/tools/task.py`，全部有测试护栏（`tests/test_task_tool.py`）：
+
+1. **深度封顶，递归在机制上不可能失控** —— runtime 携带 `subagentDepth` 计数；到达上限时 spawn 被拒绝，且 `task` 工具从子注册表中被剔除（孙 Agent 连尝试的入口都没有）。
+2. **句柄复用，spawn 零重建** —— 父回合经 `tool_runtime` 注入 `toolRegistry` 与 `modelAdapter`（`minicode/graph/runtime.py`）；子 Agent 直接复用，不再重做 Skill 发现、MCP 连接和模型适配器构建，且 provider/mock 模式与父完全一致。
+3. **并发扇出 + 全局槽位** —— `task` 标记 `CONCURRENCY_SAFE`，模型一批 N 个 task 调用自动进入 ToolScheduler 并行阶段；进程级信号量封顶同时在跑的子 Agent 数（默认 4）。
+4. **事件冒泡，子 Agent 运行不静默** —— `_SubagentEventForwarder` 把子 Agent 的阶段进度、工具启动、工具失败加 `[sub:类型]` 前缀实时转发到父事件队列；思考流/流式块刻意不转发（避免与父流交错）。
+5. **超时与检查点隔离** —— `task` 自声明 `timeout_seconds=600`（工具级声明优先于全局 `MINICODE_TOOL_TIMEOUT` 与调度器收紧）；子 runtime 剥离 `graphCheckpoint`，并行扇出不会争抢同一 sqlite 检查点文件。
+
+### 相关环境变量
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `MINICODE_SUBAGENT_MAX_DEPTH` | `1` | 子 Agent 世代深度上限；`2` 允许孙 Agent |
+| `MINICODE_SUBAGENT_MAX_CONCURRENCY` | `4` | 同时运行的子 Agent 数上限 |
+
+### 使用示例
+
+```text
+你：同时派两个 explore 子 agent：一个分析 minicode/graph，一个分析 minicode/tools，汇总对比两者的组织方式。
+
+TUI 实时显示：
+  [sub:Explore] Runtime phase: explore. inspect, decompose...
+  [sub:Explore] ▶ read_file
+  [sub:Explore] ▶ grep_files
+  （两个子 Agent 的进度流交错滚动，互不阻塞）
+  [Sub-agent Explore completed] Turns: ... Duration: ...
+  助手：两个目录的对比结论……（基于两份战报合并）
+```
+
+## Reasoning 模型支持（思考流）
+
+OpenAI 兼容通道（`minicode/openai_adapter.py`）解析 DeepSeek R1 / vLLM 网关的 `reasoning_content`（及 OpenRouter 的 `reasoning`）字段：
+
+- **流式**：每个 `delta.reasoning_content` 片段即时转发 `on_thinking_delta` —— 思考过程逐段实时到达，不是等响应结束；
+- **非流式**：`message.reasoning_content` 整段一次性转发；
+- 下游管道（runtime → TurnEventQueue → TUI）把它渲染为消息下方的 `∴ Thinking…` 实时增长条目；
+- 回调异常被隔离，UI 故障不会杀掉模型步。
+
+端到端实测（reasoning 模型，完整 agent 步）：207 个 thinking 事件、653 字符思考逐段流回，最终回答正常落盘。
 
 ## 架构：LangGraph 单一拓扑（Slice 5 默认）
 
 锚点：`minicode/graph/builder.py:build_model_graph` + `minicode/graph/runtime.py:run_graph_turn`。
-所有回边收敛到 **策略检查** 节点，每步只跑一次预算/策略事件。
+所有回边收敛到 **策略检查** 节点，每步只跑一次预算/策略事件。这张图同时是父回合与所有子 Agent 的执行体。
+图中**实线为原有主拓扑**（一字未动）；**虚线是 `task` 工具补入的多 Agent 逻辑**：并行扇出 → 同构图递归 → 战报以 tool_result 回流观测节点，子 Agent 事件实时冒泡到 TUI。
 
 ```mermaid
 flowchart TD
@@ -41,7 +136,7 @@ flowchart TD
     SP -- "预算耗尽" --> FZ[收尾]
     SP -- "仍有剩余步数" --> MD[模型推理]
     MD --> CS{决策分类}
-    CS -- "去鉴权" --> AUTH{鉴权}
+    CS -- "去鉴权（含 task 调用）" --> AUTH{鉴权}
     AUTH -- "允许" --> EX[执行工具]
     AUTH -- "拒绝" --> FZ
     EX --> OBS{观测工具}
@@ -58,11 +153,25 @@ flowchart TD
     FZ --> END([结束])
     END -- "完成/等待用户" --> HUMAN_END([👤 用户])
 
+    %% ---- 多 Agent 补入逻辑（task 工具 = 同构图递归）----
+    EX -. "task 调用 · 其余工具直行" .-> FANOUT{{"并行扇出<br/>调度器并行批 · 全局槽位 ≤ 4"}}
+    FANOUT --> SA1["子 Agent ①"]
+    FANOUT --> SA2["子 Agent N"]
+    SA1 & SA2 --> SUBG["同构图递归：推理→鉴权→执行→观测→校验<br/>深度+1 · 工具白名单 · 复用父注册表/适配器 · 独立 max_steps"]
+    SUBG -. "深度到顶：task 从子注册表剔除<br/>再 spawn 直接被拒" .-> CAP{{"递归封顶"}}
+    SUBG --> REPORT["战报 = 最终 assistant 消息"]
+    REPORT -- "以 tool_result 回流父回合" --> OBS
+    SUBG -. "[sub:类型] 进度/工具事件实时冒泡" .-> TUIQ["父事件队列 → TUI 实时显示"]
+    TUIQ -. "运行期间进度可见" .-> HUMAN_START
+
     style SP fill:#e8f0fe,stroke:#4285f4
     style CS fill:#fef7e0,stroke:#fbbc04
     style AUTH fill:#fce8e6,stroke:#ea4335
     style V fill:#e6f4ea,stroke:#34a853
     style FZ fill:#f3e8fd,stroke:#8430ce
+    style FANOUT fill:#fef7e0,stroke:#fbbc04
+    style SUBG fill:#e8f0fe,stroke:#4285f4
+    style REPORT fill:#e6f4ea,stroke:#34a853
 ```
 
 ### Human-In-The-Loop
@@ -129,14 +238,26 @@ python -m minicode.manage_cli skills remove <name> [--project]
 }
 ```
 
-常用环境变量：
+### 项目 .env（自动加载）
+
+`minicode/config.py:_load_env_file` 在 `load_runtime_config` 时读取项目根 `.env`，
+只补缺失的进程环境变量（已 export 的值永不覆盖），无需 dotenv 依赖。支持注释、
+引号值、`export ` 前缀；重复键首个生效。OpenAI 兼容第三方端点用 `CUSTOM_API_KEY` + `CUSTOM_API_BASE_URL`。
+测试进程默认 `MINICODE_DISABLE_ENV_FILE=1` 隔离开发者本地凭据（见 `conftest.py`）。
+
+### 常用环境变量
 
 | 变量 | 说明 |
 | --- | --- |
 | `MINI_CODE_MODEL_MODE=mock` | 无 Key 跑通全流程 |
-| `MINICODE_TOOL_TIMEOUT` | 单工具超时秒数（默认 120） |
+| `CUSTOM_API_KEY` / `CUSTOM_API_BASE_URL` | OpenAI 兼容自定义端点 |
+| `MINICODE_MODEL_TIMEOUT` | 单次模型推理超时秒数（默认 120；reasoning 模型建议 ≥ 240） |
+| `MINICODE_TOOL_TIMEOUT` | 单工具超时秒数（默认 120；工具自声明 `timeout_seconds` 优先） |
+| `MINICODE_SUBAGENT_MAX_DEPTH` | 子 Agent 世代深度上限（默认 1） |
+| `MINICODE_SUBAGENT_MAX_CONCURRENCY` | 并行子 Agent 槽位上限（默认 4） |
 | `MINICODE_GRAPH_CHECKPOINT=1` | 无 session 时也启用文件检查点 |
 | `MINI_CODE_COMMAND_ENCODING` | Windows 命令输出编码 |
+| `MINICODE_DISABLE_ENV_FILE=1` | 禁用项目 .env 自动加载（测试默认开） |
 | `MINICODE_MEMORY_PIPELINE=0` | 关闭记忆管线（跳过 `MemoryPipeline.read/write`，仅保留 `MemoryManager` 基础上下文，适合大仓/低配 CI 降开销） |
 
 ## 工程结构
@@ -159,6 +280,8 @@ python -m minicode.structure_check
 ```bash
 python -m pytest tests/ -q
 ```
+
+多 Agent 与思考流的针对性套件：`tests/test_task_tool.py`（深度/复用/扇出/冒泡 13 例）、`tests/test_openai_adapter.py`（reasoning 解析）、`tests/test_input_parser.py`（括号粘贴回归）。
 
 ## 记忆系统（Memory）
 
@@ -213,9 +336,3 @@ python -m minicode.release_readiness --check-fallback-evidence benchmarks/releas
 python -m minicode.release_readiness --check-release-report benchmarks/release_readiness_results.json
 python -m minicode.release_readiness --check-release-markdown benchmarks/release_readiness_results.md --release-json benchmarks/release_readiness_results.json
 ```
-
-## TODO
-
-- [ ] 多 Agent 协调（基于现有 thread_id 检查点做父子图）
-- [x] ~~重写记忆系统~~（已完成：MemoryPipeline 四动词闭环 + PID 注入控制 + 失败恢复通道 + 图谱 superseded 审计 + 开销开关 MINICODE_MEMORY_PIPELINE=0）
-- [x] ~~重写 Skill 载入~~（已完成：热榜 Top20 + BM25 任务相关性二排）

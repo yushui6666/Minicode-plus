@@ -234,7 +234,7 @@ def parse_input_chunk(chunk: str, incoming_chunk: str | None = None) -> ParseRes
                     paste_text = chunk[i:paste_end]
                     # Strip control characters except newline and tab
                     paste_text = ''.join(c for c in paste_text if c.isprintable() or c in '\n\t')
-                    events.append(TextEvent(text=paste_text, ctrl=False))
+                    events.append(TextEvent(text=paste_text, ctrl=False, meta=False))
                     i = paste_end + 6  # Skip past \x1b[201~
                     continue
                 else:
