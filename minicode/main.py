@@ -149,18 +149,6 @@ def _handle_list_sessions_request(cwd: str, *, workspace_only: bool) -> int:
 def _handle_readiness_request(cwd: str, *, json_output: bool) -> int:
     if json_output:
         from minicode.product_surfaces import build_readiness_report
-from minicode.skill_hotlist import get_hot_skills_for_prompt
-
-
-def _get_prompt_skills(cwd: str, tools, query: str | None = None) -> list[dict]:
-    """Hotlist Top20 for prompt injection (BM25-reranked by query), fallback to full discover."""
-    try:
-        return get_hot_skills_for_prompt(cwd, query=query)
-    except Exception:
-        try:
-            return tools.get_skills() if tools else []
-        except Exception:
-            return []
 
         print(
             json.dumps(
@@ -173,6 +161,20 @@ def _get_prompt_skills(cwd: str, tools, query: str | None = None) -> list[dict]:
     result = try_handle_local_command("/readiness", cwd=cwd)
     print(result or "No readiness report is available.")
     return 0
+
+
+from minicode.skill_hotlist import get_hot_skills_for_prompt
+
+
+def _get_prompt_skills(cwd: str, tools, query: str | None = None) -> list[dict]:
+    """Hotlist Top20 for prompt injection (BM25-reranked by query), fallback to full discover."""
+    try:
+        return get_hot_skills_for_prompt(cwd, query=query)
+    except Exception:
+        try:
+            return tools.get_skills() if tools else []
+        except Exception:
+            return []
 
 
 def _handle_list_checkpoints_request(cwd: str, session_id: str | None) -> int:
@@ -502,6 +504,63 @@ def main() -> None:
     from minicode.memory import MemoryManager
     memory_mgr = MemoryManager(project_root=Path(cwd))
     logger.info("Memory manager initialized")
+
+    def _memory_text(query: str) -> str:
+        """Context text via MemoryManager, enriched by MemoryPipeline when up."""
+        # Fast-path kill-switch: MINICODE_MEMORY_PIPELINE=0 skips pipeline enrichment entirely
+        if os.getenv("MINICODE_MEMORY_PIPELINE", "").strip().lower() in {"0", "false", "off", "no", "disable", "disabled"}:
+            try:
+                return memory_mgr.get_relevant_context(query=query)
+            except TypeError:
+                return memory_mgr.get_relevant_context()
+        try:
+            base = memory_mgr.get_relevant_context(query=query)
+        except TypeError:
+            base = memory_mgr.get_relevant_context()
+        try:
+            pipe = getattr(memory_mgr, "_pipeline", None)
+            if pipe is None:
+                from minicode.memory_pipeline import MemoryPipeline
+
+                pipe = MemoryPipeline(memory_mgr)
+                pipe.initialize(model_adapter=model)
+                memory_mgr._pipeline = pipe
+            # Pipeline internal also honors the env, but skip read entirely when disabled
+            if os.getenv("MINICODE_MEMORY_PIPELINE", "").strip().lower() in {"0", "false", "off", "no", "disable", "disabled"}:
+                return base
+            entries = pipe.read(query)
+            extra = "\n".join(
+                f"- {entry['content']}" for entry in entries[:8] if entry.get("content")
+            )
+            if extra:
+                base = base + "\n" + extra if base else extra
+        except Exception:
+            logger.debug("Pipeline memory enrichment skipped", exc_info=True)
+        return base
+
+    def _remember_turn(task: str, result_messages: list) -> None:
+        """Post-turn reflection + failure recovery through the pipeline."""
+        if os.getenv("MINICODE_MEMORY_PIPELINE", "").strip().lower() in {"0", "false", "off", "no", "disable", "disabled"}:
+            return
+        pipe = getattr(memory_mgr, "_pipeline", None)
+        if pipe is None:
+            return
+        trace = [{"type": "assistant", "steps": len(result_messages)}]
+        for message in result_messages[-12:]:
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "tool_result"
+                and message.get("isError")
+            ):
+                trace.append({
+                    "type": "error",
+                    "message": str(message.get("content", ""))[:200],
+                    "tool": str(message.get("toolName") or "tool"),
+                })
+        try:
+            pipe.write(task, trace)
+        except Exception:
+            logger.debug("Pipeline post-turn reflection failed", exc_info=True)
     
     # Initialize UserProfileManager for user preferences
     from minicode.user_profile import UserProfileManager
@@ -616,7 +675,7 @@ def main() -> None:
                     {
                         "skills": _get_prompt_skills(cwd, tools, query=user_input),
                         "mcpServers": tools.get_mcp_servers(),
-                        "memory_context": memory_mgr.get_relevant_context(query=user_input),
+                        "memory_context": _memory_text(user_input),
                         "runtime": runtime,
                     },
                 )
@@ -642,6 +701,7 @@ def main() -> None:
                 if context_mgr:
                     stats = context_mgr.get_stats()
                     logger.debug("After turn: %d tokens (%.0f%%)", stats.total_tokens, stats.usage_percentage)
+                _remember_turn(user_input, messages)
                 last_assistant = next((message for message in reversed(messages) if message["role"] == "assistant"), None)
                 if last_assistant:
                     _append_transcript(transcript, kind="assistant", body=last_assistant["content"])

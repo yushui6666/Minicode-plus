@@ -20,6 +20,7 @@ Sub-components (internal, not exposed):
 from __future__ import annotations
 
 from copy import deepcopy
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,12 @@ from typing import Any
 from minicode.logging_config import get_logger
 
 logger = get_logger("memory_pipeline")
+
+
+def _is_memory_pipeline_disabled() -> bool:
+    """Runtime kill-switch: set MINICODE_MEMORY_PIPELINE=0 to skip memory overhead."""
+    raw = os.getenv("MINICODE_MEMORY_PIPELINE", "").strip().lower()
+    return raw in {"0", "false", "off", "no", "disable", "disabled"}
 
 
 class MemoryPipeline:
@@ -63,6 +70,12 @@ class MemoryPipeline:
         self._defer_graph_consolidation = False
         self._domain_classifier_loaded = False
 
+        # Wiring state: control-loop health, pending failure-recovery notes,
+        # and the periodic-maintenance counter used by _post_write_hooks().
+        self._last_stability_score: float | None = None
+        self._pending_recovery: list[Any] = []
+        self._writes_since_maintain = 0
+
         self._initialized = False
         self._read_count = 0
         self._write_count = 0
@@ -90,6 +103,10 @@ class MemoryPipeline:
         facts or edges.  It is opt-in because the lexical path is the
         validated default while graph construction remains experimental.
         """
+        if _is_memory_pipeline_disabled():
+            logger.info("MemoryPipeline disabled via MINICODE_MEMORY_PIPELINE=0 — skipping init")
+            self._initialized = False
+            return
         self._model = model_adapter
         self._workspace = workspace_path
         self._defer_graph_consolidation = bool(defer_graph_consolidation)
@@ -292,7 +309,8 @@ class MemoryPipeline:
 
     def consolidate_graph(self, max_memories: int | None = None) -> int:
         """Flush deferred graph linking without changing the memory files."""
-
+        if _is_memory_pipeline_disabled():
+            return 0
         if not self._graph_store:
             return 0
         try:
@@ -307,6 +325,75 @@ class MemoryPipeline:
             return 0
 
     # ── READ: Memory retrieval ─────────────────────────────────────
+
+    # ── WIRING: control state + failure recovery ────────────────────
+
+    def update_control_state(
+        self,
+        stability_score: float | None = None,
+        performance_score: float | None = None,
+    ) -> None:
+        """Feed observed controller health into injection decisions.
+
+        CyberneticOrchestrator.step_end calls this with the stability score
+        its PID stack (incl. AdaptivePIDTuner) observes, so injection
+        decisions consume real tuned-gain output instead of fixed rules.
+        """
+        if _is_memory_pipeline_disabled():
+            return
+        if stability_score is not None:
+            try:
+                self._last_stability_score = max(0.0, min(1.0, float(stability_score)))
+            except (TypeError, ValueError):
+                pass
+
+    def _current_pid_adjustment(self) -> float | None:
+        """Normalized [-1, 1] trim derived from observed system stability."""
+        if self._last_stability_score is None:
+            return None
+        return max(-1.0, min(1.0, (self._last_stability_score - 0.5) * 2.0))
+
+    def on_failure(self, error_message: str, tool_name: str = "") -> list[Any]:
+        """Search similar past failures/solutions now and stash the notes.
+
+        The stashed notes are consumed by the next successful 'inject()'
+        call, so recovery context reaches the very next attempt without any
+        dedicated caller in the agent loop.
+        """
+        if _is_memory_pipeline_disabled():
+            return []
+        if not self._injector or not self._memory:
+            return []
+        try:
+            recovered = self._injector.inject_on_failure(error_message, tool_name or "tool")
+        except Exception:
+            return []
+        if recovered:
+            self._pending_recovery = list(recovered)
+        return recovered
+
+    def _post_write_hooks(self, execution_trace: list[dict[str, Any]]) -> None:
+        """After every task write: failure recovery + periodic maintenance."""
+        if _is_memory_pipeline_disabled():
+            return
+        trace = execution_trace or []
+        for item in trace:
+            if (
+                isinstance(item, dict)
+                and str(item.get("type", "")).lower() in {"error", "tool_error"}
+            ):
+                self.on_failure(
+                    str(item.get("message") or item.get("error") or "task failure"),
+                    str(item.get("tool") or item.get("tool_name") or "tool"),
+                )
+                break
+        self._writes_since_maintain += 1
+        if self._writes_since_maintain >= 10:
+            self._writes_since_maintain = 0
+            try:
+                self.maintain()
+            except Exception:
+                logger.debug("Periodic maintain after write failed", exc_info=True)
 
     def read(
         self,
@@ -326,6 +413,8 @@ class MemoryPipeline:
 
         Returns list of {id, content, domain, relevance, source}.
         """
+        if _is_memory_pipeline_disabled():
+            return []
         graph_policy = self._graph_query_policy(task_description)
         graph_trace = self._new_graph_trace(graph_policy)
         if not self._memory:
@@ -539,6 +628,8 @@ class MemoryPipeline:
         Adaptive cooldown (T1): τ_cool = τ_base × (1 - context_pressure).
         Returns modified messages with memory context appended to system message.
         """
+        if _is_memory_pipeline_disabled():
+            return messages
         if not self._initialized or not self._memory:
             return messages
 
@@ -556,11 +647,18 @@ class MemoryPipeline:
                 injected = self._injector.inject_for_task(
                     task_description,
                     current_files=current_files,
+                    pid_adjustment=self._current_pid_adjustment(),
                 )
                 if injected:
                     memory_context = "\n## Relevant Project Memory\n" + "\n".join(
                         f"- {m.content[:200]}" for m in injected[:5]
                     )
+                    if self._pending_recovery:
+                        recovery = self._pending_recovery
+                        self._pending_recovery = []
+                        memory_context += "\n## Failure Recovery Notes\n" + "\n".join(
+                            f"- {m.content[:200]}" for m in recovery[:3]
+                        )
                     for i, msg in enumerate(messages):
                         if msg.get("role") == "system":
                             messages[i] = {
@@ -590,6 +688,8 @@ class MemoryPipeline:
         Uses ReflectionEngine to extract TaskContext with files, libraries,
         and domain tags. Returns the created memory entry ID or None.
         """
+        if _is_memory_pipeline_disabled():
+            return None
         if not self._reflection:
             return None
 
@@ -638,11 +738,13 @@ class MemoryPipeline:
                     "MemoryPipeline: wrote reflection success=%s confidence=%.2f",
                     result.success, result.confidence,
                 )
+                self._post_write_hooks(execution_trace)
                 self.save_state()
                 return getattr(entry, 'id', None)
         except Exception:
             pass
 
+        self._post_write_hooks(execution_trace)
         self.save_state()
         return None
 
@@ -704,6 +806,8 @@ class MemoryPipeline:
 
         Returns CuratorReport as dict, or None if not ready.
         """
+        if _is_memory_pipeline_disabled():
+            return None
         if not self._curator:
             return None
 

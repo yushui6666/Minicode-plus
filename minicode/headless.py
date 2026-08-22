@@ -236,6 +236,42 @@ def run_headless(prompt: str | None = None, allow_edits: bool = False) -> str:
         runtime=runtime,
     )
 
+    memory_pipeline = None
+    _pipeline_disabled = os.getenv("MINICODE_MEMORY_PIPELINE", "").strip().lower() in {"0", "false", "off", "no", "disable", "disabled"}
+    if not _pipeline_disabled:
+        try:
+            from minicode.memory_pipeline import MemoryPipeline
+
+            memory_pipeline = MemoryPipeline(memory_mgr)
+            memory_pipeline.initialize(model_adapter=model)
+        except Exception:
+            memory_pipeline = None
+    else:
+        from minicode.logging_config import get_logger as _get_logger
+        _get_logger("headless").info("MemoryPipeline disabled via MINICODE_MEMORY_PIPELINE=0 — headless runs without it")
+
+    def _headless_memory_text(query: str = "") -> str:
+        """Context text via MemoryManager, enriched by MemoryPipeline when up."""
+        if os.getenv("MINICODE_MEMORY_PIPELINE", "").strip().lower() in {"0", "false", "off", "no", "disable", "disabled"}:
+            try:
+                return memory_mgr.get_relevant_context(query=query)
+            except TypeError:
+                return memory_mgr.get_relevant_context()
+        try:
+            base = memory_mgr.get_relevant_context(query=query)
+        except TypeError:
+            base = memory_mgr.get_relevant_context()
+        if memory_pipeline is None:
+            return base
+        try:
+            entries = memory_pipeline.read(query)
+            extra = "\n".join(f"- {e['content']}" for e in entries[:8] if e.get("content"))
+            if extra:
+                base = base + "\n" + extra if base else extra
+        except Exception:
+            pass
+        return base
+
     messages = [
         {
             "role": "system",
@@ -260,7 +296,7 @@ def run_headless(prompt: str | None = None, allow_edits: bool = False) -> str:
             messages=messages,
             cwd=cwd,
             permissions=permissions,
-            load_context=lambda _state: memory_mgr.get_relevant_context(),
+            load_context=lambda _state: _headless_memory_text(),
         )
 
         # Extract last assistant message
@@ -269,6 +305,11 @@ def run_headless(prompt: str | None = None, allow_edits: bool = False) -> str:
             None,
         )
         response_text = last_assistant["content"] if last_assistant else "(no response)"
+        if memory_pipeline is not None and os.getenv("MINICODE_MEMORY_PIPELINE", "").strip().lower() not in {"0", "false", "off", "no", "disable", "disabled"}:
+            try:
+                memory_pipeline.write(prompt, [{"type": "assistant", "steps": len(result_messages)}])
+            except Exception:
+                pass
         _write_headless_messages_trace(
             trace_output_path,
             cwd=cwd,

@@ -137,6 +137,7 @@ python -m minicode.manage_cli skills remove <name> [--project]
 | `MINICODE_TOOL_TIMEOUT` | 单工具超时秒数（默认 120） |
 | `MINICODE_GRAPH_CHECKPOINT=1` | 无 session 时也启用文件检查点 |
 | `MINI_CODE_COMMAND_ENCODING` | Windows 命令输出编码 |
+| `MINICODE_MEMORY_PIPELINE=0` | 关闭记忆管线（跳过 `MemoryPipeline.read/write`，仅保留 `MemoryManager` 基础上下文，适合大仓/低配 CI 降开销） |
 
 ## 工程结构
 
@@ -157,6 +158,60 @@ python -m minicode.structure_check
 
 ```bash
 python -m pytest tests/ -q
+```
+
+## 记忆系统（Memory）
+
+内置闭环控制式跨会话记忆，统一入口 `MemoryPipeline`（`minicode/memory_pipeline.py`），四个动词覆盖完整生命周期：
+
+| 动词 | 时机 | 行为 |
+| --- | --- | --- |
+| `read` | 任务开始 | 领域分类 → BM25 → 向量 RRF 融合 → LLM 精选；关系型/时序问题自动路由记忆图谱 |
+| `inject` | 提示词组装 | PID 反馈控制决定注多少、注多严，追加进 system prompt |
+| `write` | 任务结束 | ReflectionEngine 蒸馏执行轨迹（决策/教训/改进点）后落盘 |
+| `maintain` | 后台周期 | CuratorAgent 合并洞察、校验过时、归档重复 |
+
+### 存储模型
+
+Scope 与 Tier 双维度正交：
+
+- Scope：USER（~/.mini-code/memory/，跨项目）/ PROJECT（.mini-code-memory/，随仓库共享）/ LOCAL（.mini-code-memory-local/，本地不入库）
+- Tier：WORKING → SHORT_TERM（<7 天）→ LONG_TERM（<30 天，压缩）→ ARCHIVAL（永久摘要）
+
+落盘走原子写入，加载带结构校验与损坏自愈，兼容手写 MEMORY.md。
+
+### 记忆图谱与 superseded 审计
+
+事实以四元组存储（subject-predicate-value + 出处 + 置信度 + 生效时间窗）。旧事实被新事实取代时**只标记不删除**：盖 valid_to 时间戳并建立 supersedes 审计边。当前查询只见有效事实；历史查询按时间点重放，可精确还原"当时相信什么"。矛盾事实标记 disputed，检索层可显式表达偏好而非静默选边。
+
+### 注入控制闭环
+
+注入量是反馈回路而非静态上限：
+
+- 上下文占用 ≥75% 切 SUMMARY 档减量，≥90% 停注
+- 检索质量低 → 减量提门槛；用户纠正 → 按次收紧（记忆可信度信号）
+- 最近失败 → STRONG 档补经验；重复任务 → 允许直接复用
+
+AdaptivePIDTuner（Ziegler-Nichols / 继电反馈 / 梯度自整定）产出的稳定性评分经 update_control_state() 直通注入决策（adaptive PID trim）——整定增益真实作用于每次注入。
+
+### 失败恢复通道
+
+回合轨迹包含工具错误时，自动检索相似历史失败与解法，下一轮以 Failure Recovery Notes 注入，无需调用方显式触发。
+
+### 主循环挂载
+
+CLI 交互循环与 headless 入口均经管线取上下文；每回合结束自动反思落盘，每 10 次 write 触发一次维护巡检。
+
+> **开销兜底开关：** 设置 `MINICODE_MEMORY_PIPELINE=0`（亦接受 `false/off/no/disable`）即可跳过整条管线，仅保留 `MemoryManager.get_relevant_context()` 的基础上下文；`MemoryPipeline.read/write/maintain/inject` 全部短路为 no-op，适合大仓/低配 CI 降延迟。取消或设为 `1` 即恢复。
+
+## 发布验证
+
+聚焦发布门禁（见 `Docs/Documentation/engineering/material-inventory.json`）：
+
+```bash
+python -m minicode.release_readiness --check-fallback-evidence benchmarks/release_readiness_results.json
+python -m minicode.release_readiness --check-release-report benchmarks/release_readiness_results.json
+python -m minicode.release_readiness --check-release-markdown benchmarks/release_readiness_results.md --release-json benchmarks/release_readiness_results.json
 ```
 
 ## TODO

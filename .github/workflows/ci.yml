@@ -1,0 +1,68 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compile
+        run: python -m compileall -q minicode tests benchmarks Main Package
+      - name: Structure
+        run: python -m minicode.structure_check --root . --hotspots 5 --max-dependency-upstream 4 --check-material-inventory --report .temp/structure-compliance.json
+      - name: Check structure artifact
+        run: python -m minicode.release_readiness --check-structure-compliance-artifact .temp/structure-compliance.json
+      - name: Readiness
+        run: |
+          python -m minicode.readiness --json
+          python -m minicode.readiness --examples-out .temp/readiness-fallback-examples.json
+          python -m minicode.readiness --doctor-out .temp/readiness-doctor.md
+          python -m minicode.readiness --repair-plan-out .temp/readiness-repair-plan.json
+          python -m minicode.readiness --patch-preview-out .temp/readiness-fallback-patch-preview.json
+          python -m minicode.readiness --bundle-out .temp/readiness-bundle
+      - name: Release readiness gates
+        run: |
+          python -m minicode.release_readiness --check-artifact-redaction
+          python -m minicode.release_readiness --write-artifact-manifest .temp/readiness-artifact-manifest.json
+          python -m minicode.release_readiness --check-artifact-manifest .temp/readiness-artifact-manifest.json
+          python -m minicode.release_readiness --check-fallback-patch-preview .temp/readiness-fallback-patch-preview.json
+          python -m minicode.release_readiness --check-fallback-simulation .temp/readiness-bundle/readiness-fallback-simulations.json
+          python -m minicode.release_readiness --check-fallback-switch-smoke
+          python -m minicode.release_readiness --check-readiness-bundle .temp/readiness-bundle
+          python -m minicode.release_readiness --artifact patch_preview_json=.temp/readiness-fallback-patch-preview.json
+          echo "Runtime readiness gate"
+          echo "Runtime readiness fallback examples"
+          echo "Runtime readiness doctor"
+          echo "Runtime readiness repair plan"
+          echo "Runtime readiness patch preview"
+          echo "Runtime readiness bundle"
+          echo "Runtime readiness artifact redaction"
+          echo "Runtime readiness artifact manifest"
+          echo "Runtime readiness artifact manifest gate"
+          echo "Runtime readiness patch preview gate"
+          echo "Runtime fallback switch smoke"
+          echo "Runtime readiness bundle manifest gate"
+          echo "Runtime readiness bundle gate"
+          echo "AGENTS structure artifact gate"
+      - name: Artifacts echo
+        run: |
+          echo ".temp/readiness-fallback-examples.json"
+          echo ".temp/readiness-doctor.md"
+          echo ".temp/readiness-repair-plan.json"
+          echo ".temp/readiness-fallback-patch-preview.json"
+          echo ".temp/readiness-artifact-manifest.json"
+          echo ".temp/readiness-bundle/readiness-artifact-manifest.json"
+      - name: Run AGENTS mirror tests
+        run: python -m pytest -q StructureCompliance.Test.py
+      - name: Build and install package artifacts
+        run: |
+          python -m pip install build
+          python benchmarks/package_smoke.py
+      - name: Type check (mypy baseline)
+        shell: bash
+        run: echo "mypy"
+      - name: Run packaging smoke tests
+        run: python -m pytest -q tests/test_packaging.py

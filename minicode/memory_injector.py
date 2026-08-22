@@ -70,6 +70,7 @@ class MemoryInjectionController:
         base_max_memories: int,
         base_min_relevance: float,
         base_max_tokens: int,
+        pid_adjustment: float | None = None,
     ) -> MemoryInjectionDecision:
         reasons: list[str] = []
         max_memories = base_max_memories
@@ -113,6 +114,16 @@ class MemoryInjectionController:
         if signal.task_repetition and signal.context_usage < 0.80:
             max_memories = min(base_max_memories + 1, max_memories + 1)
             reasons.append("repeated task can reuse memory")
+
+        # Adaptive PID trim, wired from CyberneticOrchestrator's tuner loop
+        # (via MemoryPipeline.update_control_state): normalized [-1, 1].
+        # Positive = healthy system -> inject more freely; negative = degraded.
+        if pid_adjustment is not None:
+            adj = max(-1.0, min(1.0, float(pid_adjustment)))
+            if abs(adj) >= 0.05:
+                max_memories += int(round(adj * 2))
+                min_relevance -= 0.10 * adj
+                reasons.append(f"adaptive PID trim {adj:+.2f}")
 
         max_memories = max(0, min(base_max_memories + 2, max_memories))
         max_tokens = max(0, max_tokens)
@@ -171,6 +182,7 @@ class MemoryInjector:
         task_description: str,
         current_files: list[str] | None = None,
         signal: MemoryInjectionSignal | None = None,
+        pid_adjustment: float | None = None,
     ) -> list[InjectedMemory]:
         """Search and prepare relevant memories for a task.
 
@@ -189,6 +201,7 @@ class MemoryInjector:
             base_max_memories=self._max_injected,
             base_min_relevance=self._min_relevance,
             base_max_tokens=self._max_tokens,
+            pid_adjustment=pid_adjustment,
         )
         self._last_decision = decision
         if decision.mode == MemoryInjectionMode.NONE:

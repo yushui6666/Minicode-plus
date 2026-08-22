@@ -87,3 +87,12 @@ __pycache__/
 *.git.bak/
 .dead-modules-backup/
 .worktrees/
+
+# Pytest / uv ephemeral dirs (benchmark cleanup: keep AGENTS structure clean)
+.pytest-tmp/
+.pytest_cache/
+.uv-cache/
+pytest-cache-files-*/
+benchmarks/__pycache__/
+.temp/pytest-of-*/
+.temp/pytest-tmp*/

@@ -347,6 +347,17 @@ class CyberneticOrchestrator:
 
         # Background memory optimization via unified pipeline
         if self.memory_pipeline:
+            # Close the tuner->injection loop: feed the stability the PID
+            # stack observes so injection decisions consume real gains.
+            if self.context_cybernetics:
+                try:
+                    system_state = self.context_cybernetics.to_system_state()
+                    self.memory_pipeline.update_control_state(
+                        stability_score=system_state.stability_score(),
+                        performance_score=system_state.performance_score(),
+                    )
+                except Exception:
+                    pass
             self.memory_pipeline.maintain()
 
         return summary

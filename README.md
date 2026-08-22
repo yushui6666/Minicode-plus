@@ -137,6 +137,7 @@ python -m minicode.manage_cli skills remove <name> [--project]
 | `MINICODE_TOOL_TIMEOUT` | 单工具超时秒数（默认 120） |
 | `MINICODE_GRAPH_CHECKPOINT=1` | 无 session 时也启用文件检查点 |
 | `MINI_CODE_COMMAND_ENCODING` | Windows 命令输出编码 |
+| `MINICODE_MEMORY_PIPELINE=0` | 关闭记忆管线（跳过 `MemoryPipeline.read/write`，仅保留 `MemoryManager` 基础上下文，适合大仓/低配 CI 降开销） |
 
 ## 工程结构
 
@@ -157,6 +158,60 @@ python -m minicode.structure_check
 
 ```bash
 python -m pytest tests/ -q
+```
+
+## Memory system
+
+MiniCode-plus includes closed-loop, cross-session memory through the unified `MemoryPipeline` entry point (`minicode/memory_pipeline.py`). Four operations cover the lifecycle:
+
+| Operation | When | Behavior |
+| --- | --- | --- |
+| `read` | Task start | Classify the domain, combine BM25 and vector RRF retrieval, then let the LLM select; route relational and temporal questions to the memory graph automatically |
+| `inject` | Prompt assembly | Use PID feedback control to decide how much memory to inject and how strict the threshold should be, then append it to the system prompt |
+| `write` | Task end | Distill the execution trace (decisions, lessons, and improvement points) with ReflectionEngine before persisting it |
+| `maintain` | Periodic background work | Merge insights, detect stale memories, and archive duplicates with CuratorAgent |
+
+### Storage model
+
+Scope and tier are orthogonal:
+
+- Scope: USER (`~/.mini-code/memory/`, shared across projects), PROJECT (`.mini-code-memory/`, shared with the repository), and LOCAL (`.mini-code-memory-local/`, local and not committed)
+- Tier: WORKING → SHORT_TERM (<7 days) → LONG_TERM (<30 days, compressed) → ARCHIVAL (permanent summary)
+
+Writes are atomic. Loading performs structural validation and self-healing for corrupted data, while remaining compatible with hand-written `MEMORY.md` files.
+
+### Memory graph and superseded audit
+
+Facts are stored as quadruples (subject, predicate, value, source, confidence, and validity window). When a new fact supersedes an old one, the old fact is marked rather than deleted: its `valid_to` timestamp and a `supersedes` audit edge preserve the history. Current queries see only valid facts; point-in-time queries replay the graph to recover what was believed at that time. Contradictions are marked `disputed`, allowing retrieval to express an explicit preference instead of silently choosing a side.
+
+### Injection control loop
+
+Injection volume is feedback-controlled rather than a static limit:
+
+- At ≥75% context usage, switch to SUMMARY mode and reduce injection; at ≥90%, stop injecting
+- Low retrieval quality reduces volume and raises the threshold; user corrections tighten it per occurrence as a memory-confidence signal
+- Recent failures add STRONG-mode experience; repeated tasks can reuse memory directly
+
+The stability score produced by `AdaptivePIDTuner` (Ziegler-Nichols, relay feedback, or gradient self-tuning) flows through `update_control_state()` into the injection decision as adaptive PID trim, so tuned gains affect every injection.
+
+### Failure recovery
+
+When a turn contains a tool error, the pipeline automatically retrieves similar historical failures and their solutions. The next turn receives these as Failure Recovery Notes without requiring an explicit caller trigger.
+
+### Main-loop integration
+
+Both the interactive CLI loop and the headless entry load context through the pipeline. Each turn is reflected and persisted automatically, and maintenance runs once every 10 writes.
+
+> **Overhead kill-switch:** set `MINICODE_MEMORY_PIPELINE=0` (also accepts `false/off/no/disable`) to skip the pipeline entirely. `MemoryManager.get_relevant_context()` remains, but `MemoryPipeline.read/write/maintain/inject` become no-ops — useful for large repos or low-cost CI where the ~5-file wiring adds visible latency. Re-enable by unsetting or setting `=1`.
+
+## Release verification
+
+Focused release gates (see `Docs/Documentation/engineering/material-inventory.json`):
+
+```bash
+python -m minicode.release_readiness --check-fallback-evidence benchmarks/release_readiness_results.json
+python -m minicode.release_readiness --check-release-report benchmarks/release_readiness_results.json
+python -m minicode.release_readiness --check-release-markdown benchmarks/release_readiness_results.md --release-json benchmarks/release_readiness_results.json
 ```
 
 ## TODO

@@ -26,6 +26,9 @@ minicode-provider-smoke = "minicode.provider_smoke:main"
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+# Benchmark cleanup: force pytest temp under AGENTS-fixed-exclusion .temp/ so structure checks stay green
+addopts = "--basetemp=.temp/pytest-tmp"
+cache_dir = ".temp/pytest-cache"
 
 [tool.setuptools]
 package-dir = {"" = "."}
